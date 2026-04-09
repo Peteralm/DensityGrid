@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Density Grid — pulse demo</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: #080808;
+      color: #ffffff;
+      font-family: system-ui, sans-serif;
+      min-height: 100vh;
+    }
+    main {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 40px 20px;
+    }
+    h1 {
+      font-size: 14px;
+      font-weight: 400;
+      letter-spacing: 0.05em;
+      opacity: 0.52;
+      margin: 0 0 24px 0;
+    }
+    #grid {
+      display: block;
+      width: 900px;
+      height: 500px;
+      background: #080808;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>@peteralm/densitygrid — pulse demo (40 × 22, blockSize 20)</h1>
+    <canvas id="grid"></canvas>
+  </main>
+
+  <script type="module">
+    import { createGrid } from '../src/index.js'
+
+    const grid = createGrid({
+      container: document.getElementById('grid'),
+      blockSize: 20,
+      countX: 40,
+      countY: 22,
+    })
+
+    // Pulse opacity between 0 and 1 via sin(time).
+    // sin * 0.5 - 0.5 ∈ [-1, 0] → base 1 + offset ∈ [0, 1].
+    const pulse = grid.registerAnimation('pulse', (block, time) => {
+      const t = time / 1000 // ms → seconds
+      return {
+        opacityOffset: Math.sin(t * 2) * 0.5 - 0.5,
+      }
+    })
+
+    pulse.play()
+
+    // Expose for console inspection.
+    window.grid = grid
+    window.pulse = pulse
+
+    console.log('grid ready. Try: grid.debug.list(), pulse.pause(), pulse.play(), pulse.cancel()')
+  </script>
+</body>
+</html>

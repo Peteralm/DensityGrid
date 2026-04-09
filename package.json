@@ -1,0 +1,12 @@
+{
+  "name": "@peteralm/densitygrid",
+  "version": "0.0.0",
+  "type": "module",
+  "main": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "files": [
+    "src"
+  ]
+}
