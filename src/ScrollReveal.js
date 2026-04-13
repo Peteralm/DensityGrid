@@ -44,6 +44,14 @@ export class ScrollReveal {
     this._lastFrameTime = -1
     /** @type {boolean} */
     this._allRevealed = false
+    /**
+     * True until the first _updateVisibility call completes. On the
+     * very first frame, rows already in the viewport are pre-revealed
+     * (enteredAt = time - totalDuration) so they appear at full opacity
+     * immediately instead of flashing in from zero.
+     * @type {boolean}
+     */
+    this._firstFrame = true
 
     this._initRows()
 
@@ -134,7 +142,12 @@ export class ScrollReveal {
     // document space to viewport space so the visibility check is correct.
     const scrollY = this._getScrollY ? this._getScrollY() : 0
 
+    const isFirstFrame = this._firstFrame
+    this._firstFrame = false
+
     // Collect rows entering this frame so we can apply row stagger.
+    // Each entry is { meta, immediate } where immediate=true means the
+    // row was already visible when ScrollReveal was first created.
     const entering = []
 
     for (const [row, meta] of this._rowMeta) {
@@ -149,7 +162,7 @@ export class ScrollReveal {
           screenY + this._layout.blockSize >= 0 &&
           screenY <= vh
         ) {
-          entering.push(meta)
+          entering.push({ meta, immediate: isFirstFrame })
           meta.seen = true
           meta.startCol = 0
         } else {
@@ -169,8 +182,17 @@ export class ScrollReveal {
 
     // Apply row stagger: when multiple rows enter on the same frame,
     // offset each successive row's enteredAt so they cascade top→bottom.
+    // Exception: rows visible on the very first frame are pre-revealed
+    // (enteredAt wound back by totalDuration) so they appear at full
+    // opacity immediately with no flash.
     for (let i = 0; i < entering.length; i++) {
-      entering[i].enteredAt = time + i * this._rowStagger
+      const { meta, immediate } = entering[i]
+      if (immediate) {
+        meta.enteredAt = time - totalDuration
+        meta.reveal = 1
+      } else {
+        meta.enteredAt = time + i * this._rowStagger
+      }
     }
 
     this._allRevealed = unseenCount === 0 && animatingCount === 0
@@ -187,6 +209,10 @@ export class ScrollReveal {
     const oldMeta = this._rowMeta
     this._rowMeta = new Map()
     this._allRevealed = false
+    // New rows that are already in the viewport (e.g. rows that appear
+    // when the grid widens on resize) should not flash in. Reset
+    // _firstFrame so _updateVisibility pre-reveals them on the next tick.
+    this._firstFrame = true
 
     for (let row = 0; row < this._layout.countY; row++) {
       const existing = oldMeta.get(row)
