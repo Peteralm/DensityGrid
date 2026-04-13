@@ -23,6 +23,10 @@ export class ScrollReveal {
    * @param {number} [options.riseDuration=35] - ms per block fade/slide
    * @param {number} [options.slideRatio=0.55] - horizontal slide as factor of step
    * @param {number} [options.rowStagger=30] - ms delay between rows entering on the same frame
+   * @param {() => number} [options.getScrollY] - optional callback returning the current
+   *   scroll offset (in px) to subtract from each block's document-space Y before
+   *   testing viewport visibility. Required when the canvas is position:fixed and blocks
+   *   live in document coordinates (fieldHeight mode). Omit for normal scrolling canvases.
    */
   constructor(grid, options = {}) {
     this._grid = grid
@@ -31,6 +35,8 @@ export class ScrollReveal {
     this._riseDuration = options.riseDuration ?? 35
     this._slideRatio = options.slideRatio ?? 0.55
     this._rowStagger = options.rowStagger ?? 30
+    /** @type {(() => number)|null} */
+    this._getScrollY = options.getScrollY ?? null
 
     /** @type {Map<number, {seen:boolean, enteredAt:number, reveal:number, startCol:number}>} */
     this._rowMeta = new Map()
@@ -121,6 +127,12 @@ export class ScrollReveal {
       1,
       (this._layout.countX - 1) * this._staggerDelay + this._riseDuration,
     )
+    // Scroll offset for fixed-canvas / document-space grids. When the
+    // canvas is position:fixed and blocks span fieldHeight, rect.top is
+    // always 0 — screenY = rect.top + blockY = blockY, which never
+    // changes with scroll. Subtracting getScrollY() converts blockY from
+    // document space to viewport space so the visibility check is correct.
+    const scrollY = this._getScrollY ? this._getScrollY() : 0
 
     // Collect rows entering this frame so we can apply row stagger.
     const entering = []
@@ -131,7 +143,7 @@ export class ScrollReveal {
         const blockY =
           this._layout.gapY +
           row * (this._layout.blockSize + this._layout.gapY)
-        const screenY = rect.top + blockY
+        const screenY = rect.top + blockY - scrollY
 
         if (
           screenY + this._layout.blockSize >= 0 &&
