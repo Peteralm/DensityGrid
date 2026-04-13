@@ -17,16 +17,27 @@ export class Layout {
    * @param {number} [params.step] - target block+gap step in px. When set,
    *   countX/countY are derived from container size on every recalculate,
    *   so the grid re-tiles itself on window resize.
+   * @param {number} [params.fieldHeight] - optional override for the
+   *   vertical extent used to compute block positions + countY. Defaults
+   *   to the container's CSS height. Set this when the consumer wants
+   *   blocks to span beyond the visible canvas (e.g. covering the full
+   *   document height so they scroll with the page). Does NOT change
+   *   canvas intrinsic size — the renderer still draws only into the
+   *   viewport-sized canvas.
+   * @param {number} [params.fieldWidth] - same idea for the horizontal axis.
    * @param {number} [params.minCountX=8]
    * @param {number} [params.minCountY=8]
    */
-  constructor({ container, blockSize, countX, countY, step, minCountX, minCountY }) {
+  constructor({ container, blockSize, countX, countY, step, fieldHeight, fieldWidth, minCountX, minCountY }) {
     /** @type {HTMLCanvasElement} */
     this.container = container
     /** @type {number} */
     this.blockSize = blockSize
     /** @type {number|undefined} auto-count driver (block+gap target) */
     this.step = step
+    /** @type {number|undefined} field dim overrides (see ctor JSDoc) */
+    this.fieldHeight = fieldHeight
+    this.fieldWidth = fieldWidth
     /** @type {number} */
     this.minCountX = minCountX ?? 8
     /** @type {number} */
@@ -112,6 +123,8 @@ export class Layout {
     if (params.countX !== undefined) this.countX = params.countX
     if (params.countY !== undefined) this.countY = params.countY
     if (params.step !== undefined) this.step = params.step
+    if (params.fieldHeight !== undefined) this.fieldHeight = params.fieldHeight
+    if (params.fieldWidth !== undefined) this.fieldWidth = params.fieldWidth
     this.recalculate({ silent: true })
     return this.countX !== prevCountX || this.countY !== prevCountY
   }
@@ -133,22 +146,32 @@ export class Layout {
     this.container.width = Math.round(this.width * this.dpr)
     this.container.height = Math.round(this.height * this.dpr)
 
-    // Step-driven auto count: derive counts from container so a window
+    // When fieldWidth / fieldHeight are provided, use them for block
+    // layout (count derivation + gap + block positions). Canvas
+    // intrinsic size still follows the container rect above — consumers
+    // use this to make blocks span a document-sized area while the
+    // canvas stays pinned to the viewport (e.g. blocks scroll with the
+    // page through an offsetPosition animation, while the canvas layer
+    // stays position:fixed).
+    const effW = this.fieldWidth != null ? this.fieldWidth : this.width
+    const effH = this.fieldHeight != null ? this.fieldHeight : this.height
+
+    // Step-driven auto count: derive counts from field dims so a window
     // resize keeps block+gap density roughly constant instead of letting
     // gaps explode (or go negative on narrow viewports).
     const prevCountX = this.countX
     const prevCountY = this.countY
     if (this.step && this.step > 0) {
-      const derivedX = Math.max(this.minCountX, Math.floor(this.width / this.step))
-      const derivedY = Math.max(this.minCountY, Math.floor(this.height / this.step))
+      const derivedX = Math.max(this.minCountX, Math.floor(effW / this.step))
+      const derivedY = Math.max(this.minCountY, Math.floor(effH / this.step))
       this.countX = derivedX
       this.countY = derivedY
     }
     const topologyChanged =
       this.countX !== prevCountX || this.countY !== prevCountY
 
-    this.gapX = (this.width - this.countX * this.blockSize) / (this.countX + 1)
-    this.gapY = (this.height - this.countY * this.blockSize) / (this.countY + 1)
+    this.gapX = (effW - this.countX * this.blockSize) / (this.countX + 1)
+    this.gapY = (effH - this.countY * this.blockSize) / (this.countY + 1)
 
     const centerCol = (this.countX - 1) / 2
     const centerRow = (this.countY - 1) / 2

@@ -30,8 +30,12 @@ export class Grid {
    *   that are keyed by block.index or countX/countY.
    * @param {number} [options.minCountX]
    * @param {number} [options.minCountY]
+   * @param {number} [options.fieldHeight] - see Layout; blocks span this
+   *   vertical extent instead of the canvas's CSS height. Use for
+   *   document-space grids that scroll through a viewport-sized canvas.
+   * @param {number} [options.fieldWidth] - see Layout.
    */
-  constructor({ container, blockSize, countX, countY, step, minCountX, minCountY }) {
+  constructor({ container, blockSize, countX, countY, step, fieldHeight, fieldWidth, minCountX, minCountY }) {
     /** @private @type {Array<() => void>} */
     this._resizeCbs = []
 
@@ -42,6 +46,8 @@ export class Grid {
       countX,
       countY,
       step,
+      fieldHeight,
+      fieldWidth,
       minCountX,
       minCountY,
     })
