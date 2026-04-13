@@ -121,6 +121,19 @@ export class Grid {
       if (this._scrollReveal) this._scrollReveal._onLayoutChange()
       this._fireResize()
     }
+    // Setting canvas.width/height inside layout.reconfigure() clears the
+    // canvas. Draw a fresh frame synchronously so users don't see a 1-frame
+    // blank while waiting for the next rAF.
+    this.forceDraw()
+  }
+
+  /**
+   * Draw one frame synchronously. Normally the render loop handles this on
+   * its own rAF cadence — use this only when you've just resized the canvas
+   * (which clears it) and want to avoid the gap before the next rAF fires.
+   */
+  forceDraw() {
+    this._renderer._draw(typeof performance !== 'undefined' ? performance.now() : Date.now())
   }
 
   /**
@@ -152,6 +165,9 @@ export class Grid {
     this.totalBlocks = this.countX * this.countY
     if (this._scrollReveal) this._scrollReveal._onLayoutChange()
     this._fireResize()
+    // Layout just resized canvas.width/height → canvas cleared. Redraw now
+    // instead of waiting for the next rAF (visible gap during drag-resize).
+    this.forceDraw()
   }
 
   /** @private */

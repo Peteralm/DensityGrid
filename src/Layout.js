@@ -54,8 +54,9 @@ export class Layout {
     /** @type {number} CSS pixel height */
     this.height = 0
 
-    /** @type {number} current devicePixelRatio */
-    this.dpr = typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1
+    /** @type {number} current devicePixelRatio (clamped to 2) */
+    const _initialDpr = typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1
+    this.dpr = Math.min(_initialDpr, 2)
 
     /**
      * Flat array of block descriptors. Shape per CLAUDE.md §6.
@@ -119,7 +120,12 @@ export class Layout {
     const rect = this.container.getBoundingClientRect()
     this.width = rect.width
     this.height = rect.height
-    this.dpr = typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1
+    // DPR clamped to 2 to match prototype behavior — on 3x/4x displays the
+    // cost of rendering at native density isn't worth the extra sharpness
+    // for a field of 20px blocks, and canvas.width hits backing-store limits
+    // on very large viewports.
+    const rawDpr = typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1
+    this.dpr = Math.min(rawDpr, 2)
 
     // Canvas intrinsic resolution = CSS size × DPR for sharp rendering
     // on high-density displays. Block positions stay in CSS pixels;
