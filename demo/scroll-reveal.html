@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Density Grid — scroll reveal demo</title>
+  <style>
+    *, *::before, *::after {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+    html, body {
+      background: #080808;
+      color: #ffffff;
+      font-family: system-ui, -apple-system, sans-serif;
+    }
+    .label {
+      position: fixed;
+      top: 20px;
+      left: 20px;
+      z-index: 10;
+      font-size: 13px;
+      font-weight: 400;
+      letter-spacing: 0.04em;
+      opacity: 0.48;
+    }
+    .hint {
+      position: fixed;
+      bottom: 28px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 10;
+      font-size: 13px;
+      font-weight: 400;
+      opacity: 0.35;
+      letter-spacing: 0.03em;
+      transition: opacity 0.8s ease;
+    }
+    .hint.hidden { opacity: 0; }
+    #grid {
+      display: block;
+      width: 100vw;
+      height: 250vh;
+    }
+  </style>
+</head>
+<body>
+  <p class="label">@peteralm/densitygrid — scroll reveal</p>
+  <p class="hint" id="hint">scroll down</p>
+  <canvas id="grid"></canvas>
+
+  <script type="module">
+    import { createGrid } from '../src/index.js'
+
+    const canvas = document.getElementById('grid')
+    // Derive column count from viewport so blocks always have
+    // visible gaps (~8px) regardless of screen width.
+    const blockSize = 14
+    const targetGap = 8
+    const step = blockSize + targetGap
+    const countX = Math.floor((canvas.offsetWidth - targetGap) / step)
+    const countY = Math.floor((canvas.offsetHeight - targetGap) / step)
+
+    const grid = createGrid({
+      container: canvas,
+      blockSize,
+      countX,
+      countY,
+    })
+
+    grid.enableScrollReveal({
+      staggerDelay: 6,
+      riseDuration: 35,
+      slideRatio: 0.55,
+    })
+
+    // Hide scroll hint after first scroll.
+    const hint = document.getElementById('hint')
+    let hintHidden = false
+    window.addEventListener('scroll', () => {
+      if (!hintHidden && window.scrollY > 40) {
+        hint.classList.add('hidden')
+        hintHidden = true
+      }
+    }, { passive: true })
+
+    window.grid = grid
+    console.log('Scroll reveal demo ready. grid.debug.list() to inspect animations.')
+  </script>
+</body>
+</html>

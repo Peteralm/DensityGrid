@@ -74,8 +74,13 @@ export class Renderer {
     const stack = this.stack
     const blockSize = layout.blockSize
     const blocks = layout.blocks
+    const dpr = layout.dpr
 
-    ctx.clearRect(0, 0, layout.width, layout.height)
+    // Reset transform and clear at full canvas resolution, then
+    // apply DPR scale so all drawing uses CSS-pixel coordinates.
+    ctx.setTransform(1, 0, 0, 1, 0, 0)
+    ctx.clearRect(0, 0, layout.width * dpr, layout.height * dpr)
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
     ctx.fillStyle = '#FFFFFF'
 
     for (let i = 0; i < blocks.length; i++) {
@@ -122,5 +127,6 @@ export class Renderer {
     }
 
     ctx.globalAlpha = 1
+    ctx.setTransform(1, 0, 0, 1, 0, 0)
   }
 }

@@ -8,8 +8,12 @@ import { Grid } from './Grid.js'
  * @param {Object} options
  * @param {HTMLCanvasElement} options.container - canvas element to render into
  * @param {number} options.blockSize - block size in px
- * @param {number} options.countX - number of blocks on the X axis
- * @param {number} options.countY - number of blocks on the Y axis
+ * @param {number} [options.countX] - fixed column count (omit when using step)
+ * @param {number} [options.countY] - fixed row count (omit when using step)
+ * @param {number} [options.step] - block+gap target in px; enables auto-count
+ *   mode where countX/countY are derived from container size on resize.
+ * @param {number} [options.minCountX] - floor for step-derived countX
+ * @param {number} [options.minCountY] - floor for step-derived countY
  * @returns {Grid}
  */
 export function createGrid(options) {
