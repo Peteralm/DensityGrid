@@ -6,6 +6,10 @@
  * each block slides in from the right and fades in, with a small
  * delay between columns creating a wave effect.
  *
+ * Rows that are already inside the viewport when ScrollReveal is
+ * created are pre-revealed synchronously in the constructor — they
+ * appear at full opacity from the very first frame with no animation.
+ *
  * Values derived from prototype.html visual specification:
  *   - staggerDelay: 6ms between columns
  *   - riseDuration: 35ms per block
@@ -44,15 +48,11 @@ export class ScrollReveal {
     this._lastFrameTime = -1
     /** @type {boolean} */
     this._allRevealed = false
-    /**
-     * True until the first _updateVisibility call completes. On the
-     * very first frame, rows already in the viewport are pre-revealed
-     * (enteredAt = time - totalDuration) so they appear at full opacity
-     * immediately instead of flashing in from zero.
-     * @type {boolean}
-     */
-    this._firstFrame = true
 
+    // Synchronously scan the viewport so rows already on-screen are
+    // marked seen + reveal=1 before the first animation frame fires.
+    // This guarantees no flash or stagger animation for initially-
+    // visible blocks — they appear at full opacity from frame zero.
     this._initRows()
 
     this._controller = grid.registerAnimation('scroll-reveal', (block, time) => {
@@ -61,14 +61,30 @@ export class ScrollReveal {
     this._controller.play()
   }
 
-  /** @private */
+  /**
+   * Initialize per-row metadata. Rows currently in the viewport are
+   * pre-revealed (seen=true, reveal=1) so they never animate in.
+   * Rows below the fold start hidden (seen=false, reveal=0).
+   * @private
+   */
   _initRows() {
     this._rowMeta.clear()
+
+    const rect = this._layout.container.getBoundingClientRect()
+    const vh = typeof window !== 'undefined' ? window.innerHeight : 0
+    const scrollY = this._getScrollY ? this._getScrollY() : 0
+
     for (let row = 0; row < this._layout.countY; row++) {
+      const blockY =
+        this._layout.gapY + row * (this._layout.blockSize + this._layout.gapY)
+      const screenY = rect.top + blockY - scrollY
+      const inViewport =
+        screenY + this._layout.blockSize >= 0 && screenY <= vh
+
       this._rowMeta.set(row, {
-        seen: false,
-        enteredAt: 0,
-        reveal: 0,
+        seen: inViewport,
+        enteredAt: 0,  // unused for pre-revealed rows (reveal=1 guard short-circuits)
+        reveal: inViewport ? 1 : 0,
         startCol: 0,
       })
     }
@@ -99,12 +115,15 @@ export class ScrollReveal {
       return { opacityOffset: -1 }
     }
 
+    // Pre-revealed rows (seen at construction time or fully animated)
+    // contribute nothing — base state opacity is correct.
+    if (meta.reveal >= 1) return null
+
     // Per-block stagger timing.
     const colOffset = block.col - meta.startCol
     const blockElapsed = time - meta.enteredAt - colOffset * this._staggerDelay
     const progress = smoothstep(0, this._riseDuration, blockElapsed)
 
-    // Fully revealed — no contribution needed, base state is correct.
     if (progress >= 1) return null
 
     const step = this._layout.blockSize + this._layout.gapX
@@ -131,28 +150,17 @@ export class ScrollReveal {
 
     const rect = this._layout.container.getBoundingClientRect()
     const vh = typeof window !== 'undefined' ? window.innerHeight : 0
+    const scrollY = this._getScrollY ? this._getScrollY() : 0
     const totalDuration = Math.max(
       1,
       (this._layout.countX - 1) * this._staggerDelay + this._riseDuration,
     )
-    // Scroll offset for fixed-canvas / document-space grids. When the
-    // canvas is position:fixed and blocks span fieldHeight, rect.top is
-    // always 0 — screenY = rect.top + blockY = blockY, which never
-    // changes with scroll. Subtracting getScrollY() converts blockY from
-    // document space to viewport space so the visibility check is correct.
-    const scrollY = this._getScrollY ? this._getScrollY() : 0
-
-    const isFirstFrame = this._firstFrame
-    this._firstFrame = false
 
     // Collect rows entering this frame so we can apply row stagger.
-    // Each entry is { meta, immediate } where immediate=true means the
-    // row was already visible when ScrollReveal was first created.
     const entering = []
 
     for (const [row, meta] of this._rowMeta) {
       if (!meta.seen) {
-        // Compute row screen position from layout gap + step.
         const blockY =
           this._layout.gapY +
           row * (this._layout.blockSize + this._layout.gapY)
@@ -162,7 +170,7 @@ export class ScrollReveal {
           screenY + this._layout.blockSize >= 0 &&
           screenY <= vh
         ) {
-          entering.push({ meta, immediate: isFirstFrame })
+          entering.push(meta)
           meta.seen = true
           meta.startCol = 0
         } else {
@@ -182,17 +190,8 @@ export class ScrollReveal {
 
     // Apply row stagger: when multiple rows enter on the same frame,
     // offset each successive row's enteredAt so they cascade top→bottom.
-    // Exception: rows visible on the very first frame are pre-revealed
-    // (enteredAt wound back by totalDuration) so they appear at full
-    // opacity immediately with no flash.
     for (let i = 0; i < entering.length; i++) {
-      const { meta, immediate } = entering[i]
-      if (immediate) {
-        meta.enteredAt = time - totalDuration
-        meta.reveal = 1
-      } else {
-        meta.enteredAt = time + i * this._rowStagger
-      }
+      entering[i].enteredAt = time + i * this._rowStagger
     }
 
     this._allRevealed = unseenCount === 0 && animatingCount === 0
@@ -202,27 +201,35 @@ export class ScrollReveal {
    * Called by Grid.reconfigure() when totalBlocks changed (countX or
    * countY was modified). Reinitializes row metadata for the new row
    * count while preserving reveal state for rows that still exist.
-   * New rows start unseen and will reveal on scroll. The animation
-   * controller is untouched — it keeps running with its current time.
+   * New rows that are already in the viewport are pre-revealed
+   * synchronously (no flash). Rows below the fold start hidden.
    */
   _onLayoutChange() {
     const oldMeta = this._rowMeta
     this._rowMeta = new Map()
     this._allRevealed = false
-    // New rows that are already in the viewport (e.g. rows that appear
-    // when the grid widens on resize) should not flash in. Reset
-    // _firstFrame so _updateVisibility pre-reveals them on the next tick.
-    this._firstFrame = true
+
+    const rect = this._layout.container.getBoundingClientRect()
+    const vh = typeof window !== 'undefined' ? window.innerHeight : 0
+    const scrollY = this._getScrollY ? this._getScrollY() : 0
 
     for (let row = 0; row < this._layout.countY; row++) {
       const existing = oldMeta.get(row)
       if (existing && existing.seen) {
+        // Row already revealed — keep its state.
         this._rowMeta.set(row, existing)
       } else {
+        // New row or previously unseen: check viewport synchronously.
+        const blockY =
+          this._layout.gapY + row * (this._layout.blockSize + this._layout.gapY)
+        const screenY = rect.top + blockY - scrollY
+        const inViewport =
+          screenY + this._layout.blockSize >= 0 && screenY <= vh
+
         this._rowMeta.set(row, {
-          seen: false,
+          seen: inViewport,
           enteredAt: 0,
-          reveal: 0,
+          reveal: inViewport ? 1 : 0,
           startCol: 0,
         })
       }
