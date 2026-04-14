@@ -173,6 +173,12 @@ export class ScrollReveal {
           entering.push(meta)
           meta.seen = true
           meta.startCol = 0
+          // Sentinel so the reveal update below computes (time - ∞) → -∞,
+          // not (time - 0) → >>1. The real enteredAt is set after the loop
+          // with per-row stagger applied. Without this, any row entering after
+          // the first ~509ms of animation time is instantly marked reveal=1
+          // (no slide-in animation).
+          meta.enteredAt = Infinity
         } else {
           unseenCount++
           continue
