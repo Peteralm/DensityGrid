@@ -61,6 +61,7 @@ export class AnimationStack {
       absoluteOpacity: null,
       offsetPosition: { x: 0, y: 0 },
       absolutePosition: null,
+      color: null,
     }
   }
 
@@ -115,6 +116,7 @@ export class AnimationStack {
     result.offsetPosition.x = 0
     result.offsetPosition.y = 0
     result.absolutePosition = null
+    result.color = null
 
     const filter = this.filter
     const list = this.controllers
@@ -157,6 +159,10 @@ export class AnimationStack {
       if (out.absolutePosition) {
         // Last-wins by stack order.
         result.absolutePosition = out.absolutePosition
+      }
+      if (out.color) {
+        // Last-wins by stack order — per-block color override.
+        result.color = out.color
       }
     }
 

@@ -81,6 +81,7 @@ export class Renderer {
     ctx.setTransform(1, 0, 0, 1, 0, 0)
     ctx.clearRect(0, 0, layout.width * dpr, layout.height * dpr)
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+    let lastFill = '#FFFFFF'
     ctx.fillStyle = '#FFFFFF'
 
     for (let i = 0; i < blocks.length; i++) {
@@ -120,6 +121,14 @@ export class Renderer {
       } else if (offsets.absolutePosition) {
         x = offsets.absolutePosition.x
         y = offsets.absolutePosition.y
+      }
+
+      // --- Color: per-block override, falls back to white base ---
+      const c = offsets.color
+      const fill = c ? `rgb(${c.r},${c.g},${c.b})` : '#FFFFFF'
+      if (fill !== lastFill) {
+        ctx.fillStyle = fill
+        lastFill = fill
       }
 
       ctx.globalAlpha = opacity
