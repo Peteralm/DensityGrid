@@ -19,7 +19,7 @@ export class Renderer {
    * @param {Layout} params.layout
    * @param {AnimationStack} params.stack
    */
-  constructor({ container, layout, stack }) {
+  constructor({ container, layout, stack, fields = null, cornerRadius = 0 }) {
     /** @type {HTMLCanvasElement} */
     this.container = container
     /** @type {CanvasRenderingContext2D} */
@@ -28,6 +28,10 @@ export class Renderer {
     this.layout = layout
     /** @type {AnimationStack} */
     this.stack = stack
+    /** @type {import('./Field.js').FieldStack|null} */
+    this.fields = fields
+    /** @type {number} block corner radius in px (0 = square corners) */
+    this.cornerRadius = cornerRadius
 
     /** @type {number} rAF handle */
     this._rafId = 0
@@ -83,6 +87,42 @@ export class Renderer {
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
     let lastFill = '#FFFFFF'
     ctx.fillStyle = '#FFFFFF'
+
+    // Field path. Cells come out of the compositor already resolved (which
+    // field won, blended or not), so drawing is a flat walk with no per-block
+    // animation evaluation. The legacy block path below stays for as long as
+    // the old pull-model animations are still in use.
+    if (this.fields && this.fields.size > 0) {
+      this.fields.compose(layout.countX, layout.countY, now)
+      const step = layout.step_
+      const ox = layout.originX
+      const oy = layout.originY
+      const r = this.cornerRadius
+      this.fields.forEachCell((gx, gy, alpha, color) => {
+        if (alpha <= 0) return
+        const fill =
+          color === 0xffffff
+            ? '#FFFFFF'
+            : `rgb(${(color >> 16) & 0xff},${(color >> 8) & 0xff},${color & 0xff})`
+        if (fill !== lastFill) {
+          ctx.fillStyle = fill
+          lastFill = fill
+        }
+        ctx.globalAlpha = alpha > 1 ? 1 : alpha
+        const x = ox + gx * step
+        const y = oy + gy * step
+        if (r > 0) {
+          ctx.beginPath()
+          ctx.roundRect(x, y, blockSize, blockSize, r)
+          ctx.fill()
+        } else {
+          ctx.fillRect(x, y, blockSize, blockSize)
+        }
+      })
+      ctx.globalAlpha = 1
+      ctx.setTransform(1, 0, 0, 1, 0, 0)
+      return
+    }
 
     for (let i = 0; i < blocks.length; i++) {
       const block = blocks[i]

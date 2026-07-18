@@ -55,9 +55,21 @@ export class Layout {
      */
     this._onTopologyChange = null
 
+    /**
+     * The single gap, in CSS px, used on BOTH axes and as the outer
+     * margin. Solved so the columns fit `effW` exactly (see recalculate).
+     * @type {number}
+     */
+    this.gap = 0
+    /** @type {number} blockSize + gap. The lattice period on both axes. */
+    this.step_ = 0
+    /** @type {number} CSS px offset of the first block's top-left corner */
+    this.originX = 0
     /** @type {number} */
+    this.originY = 0
+
+    /** @deprecated aliases of `gap` — the two axes can no longer diverge. */
     this.gapX = 0
-    /** @type {number} */
     this.gapY = 0
 
     /** @type {number} CSS pixel width */
@@ -146,6 +158,28 @@ export class Layout {
     this.container.width = Math.round(this.width * this.dpr)
     this.container.height = Math.round(this.height * this.dpr)
 
+    // Runaway guard, once per Layout. <canvas> is a REPLACED element: with
+    // `width: auto` its CSS size is its INTRINSIC size, so `position: fixed;
+    // inset: 0` (or any absolute box) does NOT stretch it. Since the line above
+    // writes the intrinsic size, an unconstrained canvas immediately reports a
+    // larger rect to the ResizeObserver, which recalculates, which writes a
+    // larger intrinsic size — the canvas grows by a factor of `dpr` every pass
+    // until the cell count melts the frame. There is no exception thrown and
+    // nothing in the output points at CSS, so detect it and say so.
+    if (!this._sizeChecked) {
+      this._sizeChecked = true
+      const after = this.container.getBoundingClientRect()
+      if (Math.abs(after.width - this.width) > 1 || Math.abs(after.height - this.height) > 1) {
+        console.warn(
+          '[densitygrid] The canvas has no CSS size, so it is sizing itself from ' +
+          'its width/height attributes and will grow without bound. Give it an ' +
+          'explicit CSS size (e.g. `width:100vw;height:100vh` or `width:100%;height:100%`) — ' +
+          '`position:fixed;inset:0` alone is not enough for a replaced element. ' +
+          `Measured ${this.width}x${this.height}, became ${after.width}x${after.height}.`
+        )
+      }
+    }
+
     // When fieldWidth / fieldHeight are provided, use them for block
     // layout (count derivation + gap + block positions). Canvas
     // intrinsic size still follows the container rect above — consumers
@@ -156,22 +190,56 @@ export class Layout {
     const effW = this.fieldWidth != null ? this.fieldWidth : this.width
     const effH = this.fieldHeight != null ? this.fieldHeight : this.height
 
-    // Step-driven auto count: derive counts from field dims so a window
-    // resize keeps block+gap density roughly constant instead of letting
-    // gaps explode (or go negative on narrow viewports).
+    // --- Lattice solve --------------------------------------------------
+    // Requirements, in priority order: square cells · ONE gap value used on
+    // both axes and as the outer margin · no block ever clipped.
+    //
+    // Those cannot all hold while also fitting both axes exactly: that is 2
+    // equations in 2 unknowns (blockSize, gap) whose determinant is
+    // (countX - countY), which collapses toward zero on near-square fields
+    // and sends blockSize/gap to absurd values (a 1000x1100 field at step 28
+    // solves to blockSize 233, gap -200). So exact fit is claimed on ONE axis
+    // only.
+    //
+    // X is the authoritative axis — width is the designed dimension (content
+    // is laid out against it; the vertical axis scrolls). The gap is solved so
+    // the columns tile `effW` exactly; the rows then take as many whole steps
+    // as fit inside `effH`, and whatever is left over becomes extra outer
+    // margin, split evenly top and bottom. blockSize is NOT solved: it stays
+    // exactly as configured, so it never drifts when the field height changes.
     const prevCountX = this.countX
     const prevCountY = this.countY
     if (this.step && this.step > 0) {
-      const derivedX = Math.max(this.minCountX, Math.floor(effW / this.step))
-      const derivedY = Math.max(this.minCountY, Math.floor(effH / this.step))
+      // round(), not floor() — the gap solve below absorbs the difference, so
+      // rounding lands closer to the requested step than truncating does.
+      let derivedX = Math.max(this.minCountX, Math.round(effW / this.step))
+      // Guard: rounding up on a field barely wider than countX*blockSize can
+      // drive the solved gap negative (blocks would overlap). Back off until
+      // it is non-negative.
+      while (derivedX > this.minCountX && effW - derivedX * this.blockSize < 0) {
+        derivedX--
+      }
       this.countX = derivedX
-      this.countY = derivedY
+    }
+
+    this.gap = (effW - this.countX * this.blockSize) / (this.countX + 1)
+    if (!(this.gap >= 0)) this.gap = 0 // NaN / negative guard
+    this.step_ = this.blockSize + this.gap
+    this.gapX = this.gap
+    this.gapY = this.gap
+
+    if (this.step && this.step > 0) {
+      const fit = this.step_ > 0 ? Math.floor((effH - this.gap) / this.step_) : this.minCountY
+      this.countY = Math.max(this.minCountY, fit)
     }
     const topologyChanged =
       this.countX !== prevCountX || this.countY !== prevCountY
 
-    this.gapX = (effW - this.countX * this.blockSize) / (this.countX + 1)
-    this.gapY = (effH - this.countY * this.blockSize) / (this.countY + 1)
+    // Center the vertical remainder as outer margin so the field is not
+    // bottom-biased. Horizontally the solve is exact, so the margin IS the gap.
+    const usedH = this.countY * this.blockSize + (this.countY + 1) * this.gap
+    this.originX = this.gap
+    this.originY = this.gap + Math.max(0, (effH - usedH) / 2)
 
     const centerCol = (this.countX - 1) / 2
     const centerRow = (this.countY - 1) / 2
@@ -181,8 +249,8 @@ export class Layout {
     let i = 0
     for (let row = 0; row < this.countY; row++) {
       for (let col = 0; col < this.countX; col++) {
-        const x = this.gapX + col * (this.blockSize + this.gapX)
-        const y = this.gapY + row * (this.blockSize + this.gapY)
+        const x = this.originX + col * this.step_
+        const y = this.originY + row * this.step_
 
         const dx = col - centerCol
         const dy = row - centerRow
@@ -215,6 +283,48 @@ export class Layout {
    */
   getTotalBlocks() {
     return this.countX * this.countY
+  }
+
+  /**
+   * CSS-pixel top-left of a cell. Inverse of `cellRectFromPx`.
+   *
+   * @param {number} col
+   * @param {number} row
+   * @returns {{x: number, y: number}}
+   */
+  cellToPx(col, row) {
+    return { x: this.originX + col * this.step_, y: this.originY + row * this.step_ }
+  }
+
+  /**
+   * Snap a CSS-pixel rectangle to the lattice, returning the cell range it
+   * covers. Used to anchor a Field to a DOM element: the field's area is
+   * always whole cells, so its contents stay phase-locked with the rest of
+   * the grid no matter where the element happens to land.
+   *
+   * Clamped to the lattice, so an element partly off-field yields a clipped
+   * (possibly empty, cols/rows = 0) range rather than out-of-range indices.
+   *
+   * @param {number} x CSS px
+   * @param {number} y CSS px
+   * @param {number} w CSS px
+   * @param {number} h CSS px
+   * @returns {{col: number, row: number, cols: number, rows: number}}
+   */
+  cellRectFromPx(x, y, w, h) {
+    const s = this.step_ || 1
+    const col0 = Math.round((x - this.originX) / s)
+    const row0 = Math.round((y - this.originY) / s)
+    const col1 = Math.round((x + w - this.originX) / s)
+    const row1 = Math.round((y + h - this.originY) / s)
+    const col = Math.max(0, Math.min(this.countX, col0))
+    const row = Math.max(0, Math.min(this.countY, row0))
+    return {
+      col,
+      row,
+      cols: Math.max(0, Math.min(this.countX, col1) - col),
+      rows: Math.max(0, Math.min(this.countY, row1) - row),
+    }
   }
 
   /**

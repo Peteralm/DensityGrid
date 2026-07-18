@@ -1,5 +1,7 @@
 import { Grid } from './Grid.js'
 
+export { Field, FieldStack } from './Field.js'
+
 /**
  * Factory for the density grid. Thin wrapper around the Grid class
  * so consumers always go through a stable functional entry point

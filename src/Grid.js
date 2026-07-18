@@ -3,6 +3,7 @@ import { Renderer } from './Renderer.js'
 import { AnimationStack } from './AnimationStack.js'
 import { AnimationController } from './AnimationController.js'
 import { ScrollReveal } from './ScrollReveal.js'
+import { Field, FieldStack } from './Field.js'
 
 /**
  * Main grid class. Wires up Layout, AnimationStack, and Renderer
@@ -35,7 +36,7 @@ export class Grid {
    *   document-space grids that scroll through a viewport-sized canvas.
    * @param {number} [options.fieldWidth] - see Layout.
    */
-  constructor({ container, blockSize, countX, countY, step, fieldHeight, fieldWidth, minCountX, minCountY }) {
+  constructor({ container, blockSize, countX, countY, step, fieldHeight, fieldWidth, minCountX, minCountY, cornerRadius = 0 }) {
     /** @private @type {Array<() => void>} */
     this._resizeCbs = []
 
@@ -68,20 +69,26 @@ export class Grid {
     this._layout._onTopologyChange = () => this._handleTopologyChange()
     /** @private @type {AnimationStack} */
     this._stack = new AnimationStack()
+    /** @private @type {FieldStack} */
+    this._fields = new FieldStack()
     /** @private @type {Renderer} */
     this._renderer = new Renderer({
       container,
       layout: this._layout,
       stack: this._stack,
+      fields: this._fields,
+      cornerRadius,
     })
 
     // Public debug namespace. Frozen so consumers can safely
     // destructure (e.g. const { list, filter } = grid.debug).
     const stack = this._stack
-    /** @type {{ list: () => Array<{name:string,status:string}>, filter: (names: string[]|null) => void }} */
+    const fieldStack = this._fields
+    /** @type {{ list: () => Array<{name:string,status:string}>, filter: (names: string[]|null) => void, fields: () => Array<Object> }} */
     this.debug = Object.freeze({
       list: () => stack.list(),
       filter: (names) => stack.setFilter(names),
+      fields: () => fieldStack.list(),
     })
 
     // Start the render loop immediately. An empty stack still
@@ -99,6 +106,60 @@ export class Grid {
    */
   registerAnimation(name, fn) {
     return new AnimationController({ name, fn, stack: this._stack })
+  }
+
+  /**
+   * Register a Field — a region of the lattice with its own producer,
+   * stacking order and merge rule. See Field.js.
+   *
+   * Registering the first field switches the renderer onto the field path;
+   * the legacy per-block animation stack stops being drawn.
+   *
+   * @param {Object} params - see the Field constructor
+   * @returns {Field}
+   */
+  addField(params) {
+    const field = new Field(params)
+    this._fields.add(field)
+    return field
+  }
+
+  /**
+   * @param {Field} field
+   */
+  removeField(field) {
+    this._fields.remove(field)
+  }
+
+  /**
+   * The lattice geometry fields need in order to place themselves.
+   * @returns {{cols:number, rows:number, step:number, blockSize:number, gap:number, originX:number, originY:number}}
+   */
+  get lattice() {
+    const l = this._layout
+    return {
+      cols: l.countX,
+      rows: l.countY,
+      step: l.step_,
+      blockSize: l.blockSize,
+      gap: l.gap,
+      originX: l.originX,
+      originY: l.originY,
+    }
+  }
+
+  /**
+   * Snap a CSS-pixel box (canvas space) to whole cells. Use to keep a field
+   * anchored to a DOM section across resize.
+   *
+   * @param {number} x
+   * @param {number} y
+   * @param {number} w
+   * @param {number} h
+   * @returns {{col:number,row:number,cols:number,rows:number}}
+   */
+  cellRectFromPx(x, y, w, h) {
+    return this._layout.cellRectFromPx(x, y, w, h)
   }
 
   /**
@@ -131,6 +192,36 @@ export class Grid {
     // canvas. Draw a fresh frame synchronously so users don't see a 1-frame
     // blank while waiting for the next rAF.
     this.forceDraw()
+  }
+
+  /**
+   * Start the internal rAF loop. It is already running after construction —
+   * call this only after `stop()`.
+   */
+  start() {
+    this._renderer.start()
+  }
+
+  /**
+   * Stop the internal rAF loop and take over the cadence yourself, pairing
+   * this with `forceDraw()`.
+   *
+   * A consumer that drives a camera has to: advance the camera, then project,
+   * then draw — in that order, every frame. Leaving the grid on its own rAF
+   * puts those in two independent callbacks, so the draw can run against the
+   * previous frame's camera. That reads as a one-frame lag on every motion.
+   */
+  stop() {
+    this._renderer.stop()
+  }
+
+  /** @type {number} block corner radius in px. 0 = square corners. */
+  get cornerRadius() {
+    return this._renderer.cornerRadius
+  }
+
+  set cornerRadius(px) {
+    this._renderer.cornerRadius = px
   }
 
   /**
