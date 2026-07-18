@@ -18,7 +18,12 @@ export class Field {
   /**
    * @param {Object} params
    * @param {string} params.name - identifier, for debug listings
-   * @param {(write: (gx: number, gy: number, alpha: number, color?: number) => void, time: number) => void} params.produce
+   * @param {(write: (gx: number, gy: number, alpha: number, color?: number, offX?: number, offY?: number) => void, time: number) => void} params.produce
+   *   `offX`/`offY` are a DRAW offset in px (default 0): the cell keeps its
+   *   lattice identity for composition (merge, zIndex, clipping) but is painted
+   *   displaced. This is how a field renders smooth sub-cell motion — a hover
+   *   warp, a shiver — without breaking phase lock: at rest the offsets are
+   *   zero and the lattice is bit-identical to never having had them.
    * @param {{col: number, row: number, cols: number, rows: number}} [params.rect]
    *   Region in lattice cells. Defaults to the whole lattice; set it (or keep
    *   it in sync via `Layout.cellRectFromPx`) to bound the field to a section.
@@ -91,6 +96,10 @@ export class FieldStack {
     this._alpha = new Float32Array(0)
     /** @private @type {Uint32Array} packed 0xRRGGBB */
     this._color = new Uint32Array(0)
+    /** @private @type {Float32Array} draw offset px */
+    this._offX = new Float32Array(0)
+    /** @private @type {Float32Array} draw offset px */
+    this._offY = new Float32Array(0)
     /** @private @type {Int32Array} touched-cell indices, for packing */
     this._dirty = new Int32Array(0)
     /** @private */
@@ -155,6 +164,8 @@ export class FieldStack {
     const stamp = this._stamp
     const alpha = this._alpha
     const color = this._color
+    const offX = this._offX
+    const offY = this._offY
     const dirty = this._dirty
     let dirtyCount = 0
 
@@ -171,7 +182,7 @@ export class FieldStack {
       const rMax = r ? r.row + r.rows - 1 : rows - 1
       const blend = field.merge === 'blend'
 
-      const write = (gx, gy, a, c) => {
+      const write = (gx, gy, a, c, ox, oy) => {
         if (gx < cMin || gx > cMax || gy < rMin || gy > rMax) return
         if (gx < 0 || gx >= cols || gy < 0 || gy >= rows) return
         if (!(a > 0)) return
@@ -183,11 +194,15 @@ export class FieldStack {
           dirty[dirtyCount++] = idx
           alpha[idx] = a
           color[idx] = c === undefined ? 0xffffff : c
+          offX[idx] = ox === undefined ? 0 : ox
+          offY[idx] = oy === undefined ? 0 : oy
           return
         }
         if (!blend) {
           alpha[idx] = a
           color[idx] = c === undefined ? 0xffffff : c
+          offX[idx] = ox === undefined ? 0 : ox
+          offY[idx] = oy === undefined ? 0 : oy
           return
         }
         // Source-over on premultiplied-by-alpha channels: the incoming cell
@@ -205,6 +220,10 @@ export class FieldStack {
           color[idx] = ((r8 & 0xff) << 16) | ((g8 & 0xff) << 8) | (b8 & 0xff)
         }
         alpha[idx] = out
+        // The topmost writer owns the motion — offsets replace, never average:
+        // a half-blended position reads as the cell tearing between two homes.
+        offX[idx] = ox === undefined ? 0 : ox
+        offY[idx] = oy === undefined ? 0 : oy
       }
 
       field.produce(write, time)
@@ -216,16 +235,18 @@ export class FieldStack {
   /**
    * Walk the cells written by the last `compose()`.
    *
-   * @param {(gx: number, gy: number, alpha: number, color: number) => void} fn
+   * @param {(gx: number, gy: number, alpha: number, color: number, offX: number, offY: number) => void} fn
    */
   forEachCell(fn) {
     const cols = this._cols
     const dirty = this._dirty
     const alpha = this._alpha
     const color = this._color
+    const offX = this._offX
+    const offY = this._offY
     for (let k = 0; k < this._dirtyCount; k++) {
       const idx = dirty[k]
-      fn(idx % cols, (idx / cols) | 0, alpha[idx], color[idx])
+      fn(idx % cols, (idx / cols) | 0, alpha[idx], color[idx], offX[idx], offY[idx])
     }
   }
 
@@ -238,6 +259,8 @@ export class FieldStack {
     this._stamp = new Uint32Array(n)
     this._alpha = new Float32Array(n)
     this._color = new Uint32Array(n)
+    this._offX = new Float32Array(n)
+    this._offY = new Float32Array(n)
     this._dirty = new Int32Array(n)
     this._dirtyCount = 0
     this._frameId = 0

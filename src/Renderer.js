@@ -98,7 +98,7 @@ export class Renderer {
       const ox = layout.originX
       const oy = layout.originY
       const r = this.cornerRadius
-      this.fields.forEachCell((gx, gy, alpha, color) => {
+      this.fields.forEachCell((gx, gy, alpha, color, offX, offY) => {
         if (alpha <= 0) return
         const fill =
           color === 0xffffff
@@ -109,8 +109,10 @@ export class Renderer {
           lastFill = fill
         }
         ctx.globalAlpha = alpha > 1 ? 1 : alpha
-        const x = ox + gx * step
-        const y = oy + gy * step
+        // offX/offY: sub-cell DRAW displacement — composition stayed on the
+        // lattice, only the paint slides.
+        const x = ox + gx * step + offX
+        const y = oy + gy * step + offY
         if (r > 0) {
           ctx.beginPath()
           ctx.roundRect(x, y, blockSize, blockSize, r)
