@@ -35,10 +35,23 @@ export class Grid {
    *   vertical extent instead of the canvas's CSS height. Use for
    *   document-space grids that scroll through a viewport-sized canvas.
    * @param {number} [options.fieldWidth] - see Layout.
+   * @param {Object<string, HTMLCanvasElement>} [options.planes] - extra raster
+   *   targets keyed by name, e.g. `{ over: canvasEl }`. A Field picks one via
+   *   `plane`; anything not named lands on `container` ('base'). All planes
+   *   share ONE Layout, so the lattice, its origin and its phase are identical
+   *   across them — the split is purely about where in the page's stacking
+   *   order the cells are painted, which is what lets DOM content be
+   *   sandwiched between fields. The consumer positions the canvases.
    */
-  constructor({ container, blockSize, countX, countY, step, fieldHeight, fieldWidth, minCountX, minCountY, cornerRadius = 0 }) {
+  constructor({ container, blockSize, countX, countY, step, fieldHeight, fieldWidth, minCountX, minCountY, cornerRadius = 0, planes = null }) {
     /** @private @type {Array<() => void>} */
     this._resizeCbs = []
+
+    // Extra raster planes, keyed by name, so a Field can declare which canvas
+    // it lands on. `container` is always 'base'. This exists for exactly one
+    // reason: page content has to be able to sit BETWEEN two fields, and one
+    // canvas cannot express that. See Field.plane.
+    const mirrors = planes ? Object.keys(planes).filter((k) => k !== 'base' && planes[k]).map((k) => planes[k]) : []
 
     /** @private @type {Layout} */
     this._layout = new Layout({
@@ -51,6 +64,7 @@ export class Grid {
       fieldWidth,
       minCountX,
       minCountY,
+      mirrors,
     })
     // Layout may have derived counts from step + container size, so pull
     // the authoritative values back out.
@@ -78,6 +92,7 @@ export class Grid {
       stack: this._stack,
       fields: this._fields,
       cornerRadius,
+      planes,
     })
 
     // Public debug namespace. Frozen so consumers can safely

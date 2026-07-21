@@ -28,9 +28,14 @@ export class Layout {
    * @param {number} [params.minCountX=8]
    * @param {number} [params.minCountY=8]
    */
-  constructor({ container, blockSize, countX, countY, step, fieldHeight, fieldWidth, minCountX, minCountY }) {
+  constructor({ container, blockSize, countX, countY, step, fieldHeight, fieldWidth, minCountX, minCountY, mirrors = [] }) {
     /** @type {HTMLCanvasElement} */
     this.container = container
+    // Extra plane canvases. They are never measured — `container` alone is
+    // the authority on size — they are only kept at the same backing-store
+    // resolution, so one lattice rasterises identically onto all of them.
+    /** @type {HTMLCanvasElement[]} */
+    this.mirrors = mirrors
     /** @type {number} */
     this.blockSize = blockSize
     /** @type {number|undefined} auto-count driver (block+gap target) */
@@ -157,6 +162,12 @@ export class Layout {
     // the Renderer applies the DPR scale transform before drawing.
     this.container.width = Math.round(this.width * this.dpr)
     this.container.height = Math.round(this.height * this.dpr)
+    for (let i = 0; i < this.mirrors.length; i++) {
+      const m = this.mirrors[i]
+      if (!m) continue
+      m.width = this.container.width
+      m.height = this.container.height
+    }
 
     // Runaway guard, once per Layout. <canvas> is a REPLACED element: with
     // `width: auto` its CSS size is its INTRINSIC size, so `position: fixed;

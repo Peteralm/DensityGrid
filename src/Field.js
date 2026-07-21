@@ -33,8 +33,15 @@ export class Field {
    * @param {boolean} [params.active=true] - false: `produce` is never called,
    *   and the field contributes nothing. This is the render-cost gate; drive
    *   it from an IntersectionObserver on the owning section.
+   * @param {string} [params.plane='base'] - which canvas this field rasterises
+   *   into. `zIndex` orders fields against each other; `plane` orders them
+   *   against the PAGE — it is what lets DOM content (a <video>, an <img>) sit
+   *   between two fields, which a single canvas cannot express. The lattice,
+   *   the compositor and the loop stay single; only the raster target differs,
+   *   so phase lock across planes is exact by construction. Unknown plane
+   *   names are dropped by the renderer rather than silently drawn to base.
    */
-  constructor({ name, produce, rect = null, zIndex = 0, merge = 'replace', active = true }) {
+  constructor({ name, produce, rect = null, zIndex = 0, merge = 'replace', active = true, plane = 'base' }) {
     /** @type {string} */
     this.name = name || 'field'
     /** @type {Function} */
@@ -47,6 +54,8 @@ export class Field {
     this.merge = merge
     /** @type {boolean} */
     this.active = active
+    /** @type {string} raster target; see the constructor doc */
+    this.plane = plane
   }
 
   /**
@@ -145,11 +154,18 @@ export class FieldStack {
   /**
    * Run every active field and composite the result.
    *
+   * Called once per PLANE per frame. The stamp/frameId trick that makes
+   * clearing free also makes the per-plane passes independent: each pass
+   * bumps `frameId`, so the previous plane's cells stop counting as live
+   * without a wipe. Cost is proportional to the cells a plane actually
+   * writes, not to the number of planes.
+   *
    * @param {number} cols lattice columns
    * @param {number} rows lattice rows
    * @param {number} time DOMHighResTimeStamp passed through to producers
+   * @param {string} [plane] compose only fields on this plane; omit for all
    */
-  compose(cols, rows, time) {
+  compose(cols, rows, time, plane) {
     this._ensure(cols, rows)
     // zIndex is re-read every frame a field is added/removed; a field that
     // mutates its own zIndex between those points is re-sorted here too, since
@@ -172,6 +188,7 @@ export class FieldStack {
     for (let f = 0; f < this._sorted.length; f++) {
       const field = this._sorted[f]
       if (!field.active || typeof field.produce !== 'function') continue
+      if (plane !== undefined && field.plane !== plane) continue
 
       // Clip to the field's rect, so a producer that writes outside its own
       // region is contained rather than corrupting a neighbour.
