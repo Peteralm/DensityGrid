@@ -19,7 +19,7 @@ export class Renderer {
    * @param {Layout} params.layout
    * @param {AnimationStack} params.stack
    */
-  constructor({ container, layout, stack, fields = null, cornerRadius = 0, planes = null }) {
+  constructor({ container, layout, stack, fields = null, cornerRadius = 0, planes = null, composite = true }) {
     /** @type {HTMLCanvasElement} */
     this.container = container
     /** @type {CanvasRenderingContext2D} */
@@ -31,12 +31,21 @@ export class Renderer {
     // see Field.plane. Each plane is a separate canvas the consumer positions
     // itself; the lattice they share is this Renderer's single Layout.
     /** @type {Array<{name: string, canvas: HTMLCanvasElement, ctx: CanvasRenderingContext2D}>} */
-    this.planes = [{ name: 'base', canvas: container, ctx: this.ctx }]
+    /** @private @type {boolean} may a plane use the composited backend at all */
+    this._composite = composite !== false
+    const mode0 = this._composite ? 'composite' : 'canvas'
+    this.planes = [{ name: 'base', canvas: container, ctx: this.ctx, mode: mode0, styleKey: '' }]
     if (planes) {
       for (const name in planes) {
         const canvas = planes[name]
         if (!canvas || name === 'base') continue
-        this.planes.push({ name, canvas, ctx: canvas.getContext('2d') })
+        this.planes.push({
+          name,
+          canvas,
+          ctx: canvas.getContext('2d'),
+          mode: mode0,
+          styleKey: '',
+        })
       }
     }
     /** @type {Layout} */
@@ -78,6 +87,11 @@ export class Renderer {
     /** @private @type {ImageData|null} */
     this._mapImg = null
 
+    /** @private @type {string} `url(...)` of the single cell tile, for CSS masking */
+    this._cellMaskUrl = ''
+    /** @private @type {string} */
+    this._cellMaskKey = ''
+
     /** @type {number} rAF handle */
     this._rafId = 0
     /** @type {boolean} */
@@ -102,6 +116,13 @@ export class Renderer {
     const plane = this.planes.find((p) => p.name === name)
     if (!plane) return
     plane.box = { top: box.top, height: box.height }
+    // THE ONLY PLACE A DEMOTED PLANE IS FORGIVEN. A plane drops to the canvas
+    // backend the instant it meets a displaced cell and stays there — see
+    // `_demote` for why it must not be a per-frame decision — so something has
+    // to offer it the cheap path back, and a layout change is the one moment
+    // where re-sizing a backing store is already expected to cost a frame.
+    plane.mode = this._composite ? 'composite' : 'canvas'
+    plane.styleKey = ''
     this._sizePlane(plane)
   }
 
@@ -116,6 +137,9 @@ export class Renderer {
    * @private
    */
   _sizePlane(plane) {
+    // A composited plane's backing store is one texel per cell, and it is
+    // sized where the band is computed. Nothing here applies to it.
+    if (plane.mode === 'composite') return
     const layout = this.layout
     const dpr = layout.dpr
     const w = Math.max(1, Math.round(layout.fieldWidth * dpr))
@@ -262,6 +286,75 @@ export class Renderer {
     return mask
   }
 
+  /**
+   * ONE CELL, as an image, for CSS to repeat.
+   *
+   * Same geometry the mask strip rasterises, expressed once: a tile `step`
+   * square with the cell body inset by half a gap, so a tile boundary falls in
+   * the middle of the gap and the body never touches it. That inset is the
+   * whole reason the composited backend survives a fractional `step` — the
+   * repeat lands each tile on a fractional device pixel, and the body has half
+   * a gap of slack on every side to absorb it.
+   *
+   * @private
+   * @returns {string} a CSS `url(...)` value
+   */
+  _ensureCellMask(layout) {
+    const step = layout.step_
+    const bs = layout.blockSize
+    const r = this.cornerRadius
+    const key = `${step}|${bs}|${r}`
+    if (key === this._cellMaskKey && this._cellMaskUrl) return this._cellMaskUrl
+    this._cellMaskKey = key
+    const half = layout.gap / 2
+    const svg =
+      `<svg xmlns="http://www.w3.org/2000/svg" width="${step}" height="${step}" ` +
+      `viewBox="0 0 ${step} ${step}">` +
+      `<rect x="${half}" y="${half}" width="${bs}" height="${bs}" rx="${r}" fill="#000"/>` +
+      `</svg>`
+    this._cellMaskUrl = `url("data:image/svg+xml,${encodeURIComponent(svg)}")`
+    return this._cellMaskUrl
+  }
+
+  /**
+   * Fill the cols×rows texel map from the composed cells, and report what
+   * shape of displacement the plane asked for. This is the predicate that
+   * chooses a backend, and it is not a new concept — it is the same question
+   * the two-blit path has always had to answer before it could commit.
+   *
+   * @private
+   * @returns {{live:number, mixed:boolean, shiftX:number, shiftY:number}}
+   */
+  _buildMap(layout) {
+    const cols = layout.countX
+    const rows = layout.countY
+    this._ensureMap(cols, rows)
+    const data = this._mapImg.data
+    data.fill(0)
+
+    let mixed = false
+    let live = 0
+    let shiftX = 0
+    let shiftY = 0
+    this.fields.forEachCell((gx, gy, alpha, color, offX, offY) => {
+      if (alpha <= 0) return
+      if (live === 0) {
+        shiftX = offX
+        shiftY = offY
+      } else if (offX !== shiftX || offY !== shiftY) {
+        mixed = true
+        return
+      }
+      const j = (gy * cols + gx) * 4
+      data[j] = (color >> 16) & 0xff
+      data[j + 1] = (color >> 8) & 0xff
+      data[j + 2] = color & 0xff
+      data[j + 3] = alpha >= 1 ? 255 : (alpha * 255 + 0.5) | 0
+      live++
+    })
+    return { live, mixed, shiftX, shiftY }
+  }
+
   /** @private one texel per cell: RGB = colour, A = alpha */
   _ensureMap(cols, rows) {
     const map = this._map || (this._map = document.createElement('canvas'))
@@ -272,6 +365,147 @@ export class Renderer {
       this._mapImg = this._mapCtx.createImageData(cols, rows)
     }
     return map
+  }
+
+  /**
+   * THE COMPOSITED BACKEND — the plane stops being a raster and becomes a
+   * styled element, and the frame cost of drawing it goes to zero.
+   *
+   * The two-blit path already proved the decomposition: a plane is
+   * ALPHA-PER-CELL times CELL-SHAPE, and those two factors are independent.
+   * The only reason they were multiplied on the main thread is that canvas was
+   * the tool in hand. CSS multiplies exactly the same pair, on the compositor:
+   *
+   *   alpha-per-cell → the canvas itself, at LATTICE resolution. One texel per
+   *                    cell, blown up with `image-rendering: pixelated`, so a
+   *                    texel covers exactly one cell stride and never resamples.
+   *   cell-shape     → `mask-image` of one cell tile, `mask-repeat: repeat` at
+   *                    `mask-size: step`. The corner is rasterised by the
+   *                    compositor, once per tile, off the main thread.
+   *
+   * What this costs per frame is a `putImageData` of cols×bandRows texels —
+   * 110×175 here, 77KB — and nothing else. No mask strip, no stencil pass, no
+   * blit of the band. What it costs in memory is that same 77KB in place of a
+   * band-sized, dpr-squared backing store: the weave's 33MB stops existing
+   * rather than getting cheaper, because a plane that never displaces never
+   * allocates the big one at all.
+   *
+   * TWO THINGS ARE LOAD-BEARING AND NEITHER IS OBVIOUS.
+   *
+   * The element box has to be an EXACT multiple of `step`, which is why the
+   * width and height are written here rather than left to the consumer's CSS.
+   * A texel grid stretched to a box that is not a whole number of steps has a
+   * pitch of `boxW / texels`, and the mask repeats at `step` regardless — the
+   * two walk out of phase across the band. At this lattice the error is 0.07px
+   * per texel, which is 7px of drift by the right-hand edge. There is no
+   * tolerance to spend here; it is exact or it is broken.
+   *
+   * The `transform` is the other. The texel grid starts half a gap BEFORE the
+   * first cell body (the same half-gap the two-blit path applies to its map
+   * blit, and for the same reason: the body must sit strictly inside its own
+   * texel, with slack on both sides). The consumer's CSS puts the canvas at
+   * document x 0 — which is what `_sizePlane` already assumes — so the half-gap
+   * and the band's row offset are applied as a translation. A transform on a
+   * leaf canvas is safe: it makes a stacking context, and the element has no
+   * descendants for that to reorder.
+   *
+   * @private
+   */
+  _paintPlaneComposite(plane, layout, box, oyLocal, live) {
+    const cols = layout.countX
+    const rows = layout.countY
+    const step = layout.step_
+    const half = layout.gap / 2
+    // Local y where texel row 0 begins. Rows the band does not cover are not
+    // allocated: a plane pays for its own section and nothing else.
+    const top0 = oyLocal - half
+    let rowStart = Math.floor(-top0 / step)
+    let rowEnd = Math.ceil((box.height - top0) / step)
+    if (rowStart < 0) rowStart = 0
+    if (rowEnd > rows) rowEnd = rows
+    const bandRows = rowEnd - rowStart
+    if (bandRows <= 0 || cols <= 0) return
+
+    const canvas = plane.canvas
+    if (canvas.width !== cols) canvas.width = cols
+    if (canvas.height !== bandRows) canvas.height = bandRows
+
+    this._applyCompositeStyle(
+      plane,
+      layout,
+      cols * step,
+      bandRows * step,
+      layout.originX - half,
+      top0 + rowStart * step
+    )
+
+    const pctx = plane.ctx
+    if (live === 0) {
+      pctx.clearRect(0, 0, cols, bandRows)
+      return
+    }
+    // The map is the full document's rows; the canvas is the band's. Placing
+    // it at a negative y lets the browser do the slicing — no second buffer,
+    // no copy, and the alpha arrives verbatim because putImageData replaces
+    // rather than composites.
+    pctx.putImageData(this._mapImg, 0, -rowStart)
+  }
+
+  /** @private */
+  _applyCompositeStyle(plane, layout, wCss, hCss, tx, ty) {
+    const key = `${wCss}|${hCss}|${tx}|${ty}|${this._cellMaskKey}`
+    if (plane.styleKey === key) return
+    const url = this._ensureCellMask(layout)
+    plane.styleKey = `${wCss}|${hCss}|${tx}|${ty}|${this._cellMaskKey}`
+    const s = plane.canvas.style
+    const size = `${layout.step_}px ${layout.step_}px`
+    s.width = `${wCss}px`
+    s.height = `${hCss}px`
+    s.transform = `translate(${tx}px, ${ty}px)`
+    s.imageRendering = 'pixelated'
+    s.webkitMaskImage = url
+    s.maskImage = url
+    s.webkitMaskSize = size
+    s.maskSize = size
+    s.webkitMaskRepeat = 'repeat'
+    s.maskRepeat = 'repeat'
+    s.webkitMaskPosition = '0 0'
+    s.maskPosition = '0 0'
+    s.maskMode = 'alpha'
+  }
+
+  /**
+   * Drop a plane to the canvas backend, permanently, until the next
+   * `setPlaneBox`.
+   *
+   * IT MUST NOT BE A PER-FRAME DECISION. Switching backends resizes the
+   * backing store, and resizing a canvas CLEARS it — a plane that oscillated
+   * between displaced and still would throw away a frame every time it
+   * changed its mind, which reads as flicker. So the demotion is one-way and
+   * a layout change is the only thing that undoes it.
+   *
+   * @private
+   */
+  _demote(plane) {
+    plane.mode = 'canvas'
+    plane.styleKey = ''
+    const s = plane.canvas.style
+    // Width goes back to the stylesheet's; height is a fact this renderer
+    // knows, so it is written rather than dropped.
+    s.width = ''
+    s.height = plane.box ? `${plane.box.height}px` : ''
+    s.transform = ''
+    s.imageRendering = ''
+    s.webkitMaskImage = ''
+    s.maskImage = ''
+    s.webkitMaskSize = ''
+    s.maskSize = ''
+    s.webkitMaskRepeat = ''
+    s.maskRepeat = ''
+    s.webkitMaskPosition = ''
+    s.maskPosition = ''
+    s.maskMode = ''
+    this._sizePlane(plane)
   }
 
   /**
@@ -334,37 +568,16 @@ export class Renderer {
    * @private
    * @returns {boolean} true if the plane was painted here
    */
-  _paintPlaneFast(pctx, layout, box, oyLocal) {
+  _paintPlaneFast(pctx, layout, box, oyLocal, m) {
     const cols = layout.countX
     const rows = layout.countY
     if (cols <= 0 || rows <= 0) return false
+    if (m.mixed) return false
 
-    const map = this._ensureMap(cols, rows)
+    const map = this._map
     const img = this._mapImg
-    const data = img.data
-    data.fill(0)
-
-    let mixed = false
-    let live = 0
-    let shiftX = 0
-    let shiftY = 0
-    this.fields.forEachCell((gx, gy, alpha, color, offX, offY) => {
-      if (alpha <= 0) return
-      if (live === 0) {
-        shiftX = offX
-        shiftY = offY
-      } else if (offX !== shiftX || offY !== shiftY) {
-        mixed = true
-        return
-      }
-      const j = (gy * cols + gx) * 4
-      data[j] = (color >> 16) & 0xff
-      data[j + 1] = (color >> 8) & 0xff
-      data[j + 2] = color & 0xff
-      data[j + 3] = alpha >= 1 ? 255 : (alpha * 255 + 0.5) | 0
-      live++
-    })
-    if (mixed) return false
+    const shiftX = m.shiftX
+    const shiftY = m.shiftY
 
     const dpr = layout.dpr
     const step = layout.step_
@@ -381,13 +594,8 @@ export class Renderer {
       Math.floor((box.height - oyLocal) / stripH)
     )
 
-    if (live === 0) {
-      // Nothing lit. The stencil-then-source-in pass would clear the plane as
-      // a side effect, but with no colour to draw there is no pass — so clear.
-      pctx.setTransform(1, 0, 0, 1, 0, 0)
-      pctx.clearRect(0, 0, pctx.canvas.width, pctx.canvas.height)
-      return true
-    }
+    // `live === 0` never reaches here — _draw clears and returns before
+    // choosing a backend, because an empty plane must not commit to one.
     if (s1 < s0) {
       pctx.setTransform(1, 0, 0, 1, 0, 0)
       pctx.clearRect(0, 0, pctx.canvas.width, pctx.canvas.height)
@@ -476,11 +684,34 @@ export class Renderer {
 
         this.fields.compose(layout.countX, layout.countY, now, plane.name)
 
-        // Every cell on the lattice, or nothing. `_paintPlaneFast` declines
-        // the moment it meets a displaced cell, and the per-cell walk below
-        // is the answer for that plane — it is the only one that can put a
-        // cell somewhere its lattice index does not.
-        if (this._paintPlaneFast(pctx, layout, box, oy)) {
+        // ONE PREDICATE CHOOSES THE BACKEND, and it is the same one the
+        // two-blit path has always evaluated: did any cell ask to be drawn
+        // somewhere its lattice index does not put it?
+        //
+        //   no displacement at all → the compositor can hold the plane (CSS)
+        //   one shared displacement → two blits, the layer sliding as a whole
+        //   per-cell displacement   → the walk; nothing else can express it
+        const m = this._buildMap(layout)
+
+        if (m.live === 0) {
+          // Nothing lit. Clear whatever this plane currently is and DO NOT
+          // commit to a backend — a plane whose section has not scrolled into
+          // view yet would otherwise adopt the composited layout and then
+          // visibly change its mind on the frame its cells arrive.
+          pctx.setTransform(1, 0, 0, 1, 0, 0)
+          pctx.clearRect(0, 0, plane.canvas.width, plane.canvas.height)
+          continue
+        }
+
+        if (plane.mode === 'composite') {
+          if (!m.mixed && m.shiftX === 0 && m.shiftY === 0) {
+            this._paintPlaneComposite(plane, layout, box, oy, m.live)
+            continue
+          }
+          this._demote(plane)
+        }
+
+        if (this._paintPlaneFast(pctx, layout, box, oy, m)) {
           pctx.setTransform(1, 0, 0, 1, 0, 0)
           continue
         }

@@ -42,8 +42,15 @@ export class Grid {
    *   order the cells are painted, which is what lets DOM content be
    *   sandwiched between fields. The consumer positions the canvases and
    *   declares which band of the document each covers, via `setPlaneBox`.
+   * @param {boolean} [options.composite=true] - let a plane that never
+   *   displaces a cell be held by the compositor instead of rasterised: the
+   *   canvas drops to one texel per cell and the cell SHAPE becomes a repeated
+   *   CSS mask. Per plane, decided per frame from the cells themselves, and
+   *   one-way until the next `setPlaneBox` — see Renderer._paintPlaneComposite
+   *   and Renderer._demote. Pass `false` to force every plane to rasterise;
+   *   that is a debugging switch, not a supported mode.
    */
-  constructor({ container, blockSize, countX, countY, step, fieldHeight, fieldWidth, minCountX, minCountY, cornerRadius = 0, planes = null }) {
+  constructor({ container, blockSize, countX, countY, step, fieldHeight, fieldWidth, minCountX, minCountY, cornerRadius = 0, planes = null, composite = true }) {
     /** @private @type {Array<() => void>} */
     this._resizeCbs = []
 
@@ -93,6 +100,7 @@ export class Grid {
       fields: this._fields,
       cornerRadius,
       planes,
+      composite,
     })
 
     // Public debug namespace. Frozen so consumers can safely
