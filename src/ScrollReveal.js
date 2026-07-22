@@ -1,6 +1,21 @@
 /**
  * Scroll-driven row reveal animation.
  *
+ * STALE SINCE THE LATTICE MOVED INTO DOCUMENT SPACE. Everything below
+ * computes a block's screen position as `container.getBoundingClientRect().top
+ * + blockY - scrollY`, which assumed the container held the whole lattice and
+ * sat in the viewport. Neither is true now: a canvas covers a BAND of the
+ * document (Renderer.setPlaneBox) and `blockY` is already a document
+ * coordinate, so that expression subtracts the scroll twice.
+ *
+ * Left as-is rather than half-fixed, because it is unused and the right fix
+ * is not a patch. In document space a row's reveal threshold is a constant,
+ * so this wants to become a comparison against the visible document range,
+ * not a per-block screen conversion — and it may want to stop existing at
+ * all, since `animation-timeline: scroll()` now expresses the same idea
+ * without a main-thread frame in the path. Do not adopt it before deciding
+ * which.
+ *
  * When enabled, all blocks start invisible. As rows scroll into the
  * viewport, they reveal with a left-to-right staggered animation:
  * each block slides in from the right and fades in, with a small
