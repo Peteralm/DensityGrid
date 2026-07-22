@@ -65,10 +65,12 @@ export class Renderer {
     // plane at 1:1 device pixels and never resamples a cell — see the
     // comment there for why it is a different technique and what it cost.
 
-    /** @private @type {HTMLCanvasElement|null} cell mask, rebuilt on topology change */
+    /** @private @type {HTMLCanvasElement|null} cell mask STRIP, rebuilt on topology change */
     this._mask = null
     /** @private @type {string} */
     this._maskKey = ''
+    /** @private @type {number} lattice rows per mask strip */
+    this._stripRows = 0
     /** @private @type {HTMLCanvasElement|null} cols×rows colour+alpha map */
     this._map = null
     /** @private @type {CanvasRenderingContext2D|null} */
@@ -82,6 +84,63 @@ export class Renderer {
     this._running = false
 
     this._tick = this._tick.bind(this)
+  }
+
+  /**
+   * Where a plane's canvas sits in the document, in CSS px, and how tall it
+   * is. A plane covers a BAND of the page — the section it serves — not the
+   * viewport and not the whole document, so painting has to translate into it.
+   *
+   * This also sizes the backing store, because Layout stopped doing that when
+   * the lattice moved into document space: there is no single canvas size to
+   * derive any more.
+   *
+   * @param {string} name
+   * @param {{top: number, height: number}} box
+   */
+  setPlaneBox(name, box) {
+    const plane = this.planes.find((p) => p.name === name)
+    if (!plane) return
+    plane.box = { top: box.top, height: box.height }
+    this._sizePlane(plane)
+  }
+
+  /**
+   * Write the canvas's intrinsic size from its band. THE RUNAWAY HAZARD LIVES
+   * HERE NOW: <canvas> is a REPLACED element, so with no CSS size its CSS box
+   * IS its intrinsic size. If a band were ever derived from a measurement of
+   * the canvas itself, this write would grow it by `dpr` on every pass until
+   * the cell count melts the frame — silently, with nothing in the console
+   * pointing at CSS. It is safe only because a band comes from the SECTION the
+   * plane serves, never from the plane. Keep it that way.
+   * @private
+   */
+  _sizePlane(plane) {
+    const layout = this.layout
+    const dpr = layout.dpr
+    const w = Math.max(1, Math.round(layout.fieldWidth * dpr))
+    const h = Math.max(1, Math.round(plane.box.height * dpr))
+    if (plane.canvas.width !== w) plane.canvas.width = w
+    if (plane.canvas.height !== h) plane.canvas.height = h
+  }
+
+  /**
+   * A plane nobody declared a band for falls back to its own CSS box, pinned
+   * to the top of the document. That is only ever right for a page whose
+   * canvas already covers what it should; it exists so the library keeps
+   * working for a consumer that has not adopted `setPlaneBox` yet.
+   * @private
+   */
+  _ensureBox(plane) {
+    if (!plane.box) {
+      const rect = plane.canvas.getBoundingClientRect()
+      plane.box = { top: 0, height: rect.height || this.layout.fieldHeight }
+    }
+    // Re-asserted every frame rather than on a resize hook: it is two integer
+    // comparisons, and it means a DPR change or a re-solved lattice cannot
+    // leave a plane at a stale backing-store size.
+    this._sizePlane(plane)
+    return plane.box
   }
 
   start() {
@@ -109,12 +168,55 @@ export class Renderer {
   }
 
   /**
-   * The CELL MASK: every lattice cell painted once, at full alpha, in the
+   * Rows per mask strip.
+   *
+   * A document-tall mask is unaffordable — at 1440×3335 and dpr 1.5 it is
+   * 43MB, per plane. But the lattice is PERIODIC in whole steps, so a strip
+   * holding a whole number of rows has identical cell phase wherever it is
+   * placed: one strip serves every band of every plane, and the memory goes
+   * back to O(viewport).
+   *
+   * The count is not simply "a viewport's worth". A strip is blitted at device
+   * resolution, so it has to land on an integer device pixel, and a strip whose
+   * device height is fractional would drift a fraction of a pixel per strip —
+   * a lattice with one uneven gap every N rows, which is exactly the defect
+   * class this library already learned to hate. So: search around a viewport's
+   * worth for the row count whose device height is nearest a whole pixel. In
+   * practice the residual comes out under 1/100 px, which means every strip
+   * rounds identically and the mask has ONE constant sub-pixel offset against
+   * the map rather than a per-strip one.
+   *
+   * @private
+   */
+  _pickStripRows(layout) {
+    const S = layout.step_ * layout.dpr
+    const vh = typeof window !== 'undefined' ? window.innerHeight : 900
+    const target = Math.max(8, Math.floor(vh / layout.step_))
+    const lo = Math.max(8, Math.floor(target * 0.75))
+    const hi = Math.max(lo + 1, Math.ceil(target * 1.25))
+    let best = target
+    let bestErr = Infinity
+    for (let n = lo; n <= hi; n++) {
+      const h = n * S
+      const err = Math.abs(h - Math.round(h))
+      if (err < bestErr) {
+        bestErr = err
+        best = n
+      }
+    }
+    return best
+  }
+
+  /**
+   * The CELL MASK: one strip of lattice cells painted at full alpha in the
    * cell's own shape. Pure geometry — it holds no content, so it survives
    * every frame and is rebuilt only when the lattice or the corner changes.
    *
-   * This is the expensive raster (≈5ms for 6528 cells), paid on resize
-   * instead of per frame.
+   * This is the expensive raster (≈5ms for a viewport of cells), paid on
+   * resize instead of per frame.
+   *
+   * The strip's own origin is 0, NOT `originY`: the document origin is applied
+   * when the strip is placed. That is what lets one strip serve every band.
    *
    * @private
    * @returns {HTMLCanvasElement}
@@ -122,22 +224,24 @@ export class Renderer {
   _ensureMask(layout) {
     const dpr = layout.dpr
     const r = this.cornerRadius
-    const key = `${layout.countX}x${layout.countY}|${layout.step_}|${layout.blockSize}|${layout.originX}|${layout.originY}|${r}|${dpr}|${layout.width}x${layout.height}`
+    const rows = this._pickStripRows(layout)
+    const key = `${layout.countX}|${rows}|${layout.step_}|${layout.blockSize}|${layout.originX}|${r}|${dpr}|${layout.fieldWidth}`
     if (key === this._maskKey && this._mask) return this._mask
     this._maskKey = key
+    this._stripRows = rows
 
     const mask = this._mask || (this._mask = document.createElement('canvas'))
-    mask.width = Math.max(1, Math.round(layout.width * dpr))
-    mask.height = Math.max(1, Math.round(layout.height * dpr))
+    mask.width = Math.max(1, Math.round(layout.fieldWidth * dpr))
+    mask.height = Math.max(1, Math.round(rows * layout.step_ * dpr))
     const mctx = mask.getContext('2d')
     mctx.setTransform(dpr, 0, 0, dpr, 0, 0)
     mctx.fillStyle = '#FFFFFF'
     const bs = layout.blockSize
     const step = layout.step_
-    for (let gy = 0; gy < layout.countY; gy++) {
+    for (let gy = 0; gy < rows; gy++) {
       for (let gx = 0; gx < layout.countX; gx++) {
         const x = layout.originX + gx * step
-        const y = layout.originY + gy * step
+        const y = gy * step
         if (r > 0) {
           mctx.beginPath()
           mctx.roundRect(x, y, bs, bs, r)
@@ -172,17 +276,29 @@ export class Renderer {
    * (33.4ms either way). Painting the same cells square instead of rounded
    * takes a 45.7ms frame to 4.2ms. The corner is the whole bill.
    *
-   * So the corner is rasterised ONCE, into a mask, and per frame the plane is:
+   * So the corner is rasterised ONCE, into a mask strip, and per frame the
+   * plane is:
    *
-   *   1. a cols×rows image — one texel per cell, RGB = colour, A = alpha —
+   *   1. the mask strip stamped down the band, building a stencil of cell
+   *      SHAPES at full alpha, and
+   *   2. a cols×rows image — one texel per cell, RGB = colour, A = alpha —
    *      blown up with smoothing OFF so each texel covers exactly one cell
-   *      stride, and
-   *   2. `destination-in` with the mask, which cuts those flat blocks down to
-   *      the cell shape and multiplies in the mask's antialiased edge.
+   *      stride, composited `source-in` so it is kept only where the stencil
+   *      is, multiplied by the stencil's antialiased edge.
    *
    * The result is the same product the per-cell path computes (alpha ×
    * coverage), and measures identical to within 1/255 — the 8-bit floor, on
    * 0.6% of pixels. 6.93ms → 0.045ms for 6528 cells.
+   *
+   * THE ORDER IS NOT ARBITRARY, and the obvious version is wrong. Painting the
+   * colour first and cutting it with `destination-in` — which is what this did
+   * while a plane was a single viewport — cannot survive a banded mask: the
+   * `-in` operators composite over the WHOLE canvas, not over the rectangle
+   * being drawn, so the second strip's `destination-in` erases the first
+   * strip's output. Stencil first, colour `source-in` last, means the colour
+   * arrives as ONE blit no matter how tall the band is, and the operator's
+   * global reach becomes the feature: everything the stencil did not keep is
+   * cleared for free, so the band needs no `clearRect` at all.
    *
    * The half-gap shift is load-bearing. A cell's body starts exactly on its
    * texel boundary, so without the shift the cell's leading edge samples the
@@ -210,7 +326,7 @@ export class Renderer {
    * @private
    * @returns {boolean} true if the plane was painted here
    */
-  _paintPlaneFast(pctx, layout) {
+  _paintPlaneFast(pctx, layout, box, oyLocal) {
     const cols = layout.countX
     const rows = layout.countY
     if (cols <= 0 || rows <= 0) return false
@@ -241,30 +357,69 @@ export class Renderer {
       live++
     })
     if (mixed) return false
-    if (live === 0) return true // plane is already clear; nothing to cut
 
     const dpr = layout.dpr
+    const step = layout.step_
+    const mask = this._ensureMask(layout)
+    const stripRows = this._stripRows
+    const stripH = stripRows * step
+
+    // Which strips touch this band. A plane only ever rasterises the slice of
+    // the document its canvas covers, so a section far up the page costs
+    // nothing to a section far down it.
+    const s0 = Math.max(0, Math.floor(-oyLocal / stripH))
+    const s1 = Math.min(
+      Math.ceil(rows / stripRows) - 1,
+      Math.floor((box.height - oyLocal) / stripH)
+    )
+
+    if (live === 0) {
+      // Nothing lit. The stencil-then-source-in pass would clear the plane as
+      // a side effect, but with no colour to draw there is no pass — so clear.
+      pctx.setTransform(1, 0, 0, 1, 0, 0)
+      pctx.clearRect(0, 0, pctx.canvas.width, pctx.canvas.height)
+      return true
+    }
+    if (s1 < s0) {
+      pctx.setTransform(1, 0, 0, 1, 0, 0)
+      pctx.clearRect(0, 0, pctx.canvas.width, pctx.canvas.height)
+      return true
+    }
+
     const half = layout.gap / 2
     this._mapCtx.putImageData(img, 0, 0)
-    const mask = this._ensureMask(layout)
 
     const smoothing = pctx.imageSmoothingEnabled
     pctx.imageSmoothingEnabled = false
     pctx.globalAlpha = 1
-    pctx.globalCompositeOperation = 'source-over'
+
+    // 1. The stencil. Device resolution, so it goes on untransformed. `copy`
+    //    on the first strip clears whatever the last frame left; the rest
+    //    accumulate. The shift is applied here as well as to the colour, or
+    //    the shapes would stay put while their colours slid out from under.
+    pctx.setTransform(1, 0, 0, 1, 0, 0)
+    pctx.globalCompositeOperation = 'copy'
+    for (let s = s0; s <= s1; s++) {
+      pctx.drawImage(
+        mask,
+        shiftX * dpr,
+        Math.round((oyLocal + s * stripH) * dpr) + shiftY * dpr
+      )
+      pctx.globalCompositeOperation = 'source-over'
+    }
+
+    // 2. The colour, in one blit whatever the band's height, kept only where
+    //    the stencil is. Everything else on the canvas is cleared by the same
+    //    operator — see the header.
+    pctx.globalCompositeOperation = 'source-in'
     pctx.setTransform(dpr, 0, 0, dpr, 0, 0)
     pctx.drawImage(
       map,
       0, 0, cols, rows,
-      layout.originX - half + shiftX, layout.originY - half + shiftY,
-      cols * layout.step_, rows * layout.step_
+      layout.originX - half + shiftX, oyLocal - half + shiftY,
+      cols * step, rows * step
     )
-    // The mask is already at device resolution, so it goes on untransformed —
-    // and it has to carry the SAME shift, or the cell shapes would stay put
-    // while their colours slid out from under them.
-    pctx.globalCompositeOperation = 'destination-in'
-    pctx.setTransform(1, 0, 0, 1, 0, 0)
-    pctx.drawImage(mask, shiftX * dpr, shiftY * dpr)
+
     pctx.globalCompositeOperation = 'source-over'
     pctx.imageSmoothingEnabled = smoothing
     return true
@@ -285,14 +440,6 @@ export class Renderer {
     const blocks = layout.blocks
     const dpr = layout.dpr
 
-    // Reset transform and clear at full canvas resolution, then
-    // apply DPR scale so all drawing uses CSS-pixel coordinates.
-    ctx.setTransform(1, 0, 0, 1, 0, 0)
-    ctx.clearRect(0, 0, layout.width * dpr, layout.height * dpr)
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
-    let lastFill = '#FFFFFF'
-    ctx.fillStyle = '#FFFFFF'
-
     // Field path. Cells come out of the compositor already resolved (which
     // field won, blended or not), so drawing is a flat walk with no per-block
     // animation evaluation. The legacy block path below stays for as long as
@@ -300,7 +447,6 @@ export class Renderer {
     if (this.fields && this.fields.size > 0) {
       const step = layout.step_
       const ox = layout.originX
-      const oy = layout.originY
       const r = this.cornerRadius
 
       // One compose + one draw per plane. Planes are independent raster
@@ -309,9 +455,14 @@ export class Renderer {
       for (let p = 0; p < this.planes.length; p++) {
         const plane = this.planes[p]
         const pctx = plane.ctx
-        pctx.setTransform(1, 0, 0, 1, 0, 0)
-        pctx.clearRect(0, 0, layout.width * dpr, layout.height * dpr)
-        pctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+        const box = this._ensureBox(plane)
+        if (!(box.height > 0)) continue
+
+        // The lattice is document space and this canvas is a band of it, so
+        // every y is written band-local. There is no scroll term anywhere in
+        // here — that is the point of the arrangement.
+        const oy = layout.originY - box.top
+
         pctx.fillStyle = '#FFFFFF'
         let planeFill = '#FFFFFF'
 
@@ -321,10 +472,16 @@ export class Renderer {
         // the moment it meets a displaced cell, and the per-cell walk below
         // is the answer for that plane — it is the only one that can put a
         // cell somewhere its lattice index does not.
-        if (this._paintPlaneFast(pctx, layout)) {
+        if (this._paintPlaneFast(pctx, layout, box, oy)) {
           pctx.setTransform(1, 0, 0, 1, 0, 0)
           continue
         }
+
+        // The fast path clears as a side effect of its final `source-in`; the
+        // per-cell walk has no such operator, so it clears for itself.
+        pctx.setTransform(1, 0, 0, 1, 0, 0)
+        pctx.clearRect(0, 0, plane.canvas.width, plane.canvas.height)
+        pctx.setTransform(dpr, 0, 0, dpr, 0, 0)
 
         this.fields.forEachCell((gx, gy, alpha, color, offX, offY) => {
           if (alpha <= 0) return
@@ -354,6 +511,14 @@ export class Renderer {
       }
       return
     }
+
+    // Legacy per-block path. It never learned about planes or bands, so it
+    // still owns the container outright and clears it whole.
+    ctx.setTransform(1, 0, 0, 1, 0, 0)
+    ctx.clearRect(0, 0, this.container.width, this.container.height)
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+    let lastFill = '#FFFFFF'
+    ctx.fillStyle = '#FFFFFF'
 
     for (let i = 0; i < blocks.length; i++) {
       const block = blocks[i]
