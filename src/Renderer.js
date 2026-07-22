@@ -194,11 +194,19 @@ export class Renderer {
     const target = Math.max(8, Math.floor(vh / layout.step_))
     const lo = Math.max(8, Math.floor(target * 0.75))
     const hi = Math.max(lo + 1, Math.ceil(target * 1.25))
+    // SMALLEST candidate that lands close enough to a whole device pixel, not
+    // the closest one. Ranking by residual alone ignores how far from target
+    // it is, and a strip is a full-page-width raster — picking the top of the
+    // range because it aligned prettily cost 24% more mask than the viewport
+    // needs, for a difference no one can see. A tenth of a device pixel is
+    // already an order of magnitude under the antialiased edge it sits in.
+    const TOL = 0.1
     let best = target
     let bestErr = Infinity
     for (let n = lo; n <= hi; n++) {
       const h = n * S
       const err = Math.abs(h - Math.round(h))
+      if (err <= TOL) return n
       if (err < bestErr) {
         bestErr = err
         best = n
