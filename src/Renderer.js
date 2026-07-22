@@ -191,8 +191,21 @@ export class Renderer {
    * the blit by half a gap puts every cell body strictly inside its own texel
    * and the error collapses to quantisation.
    *
-   * Declines (returns false) when any cell on the plane carries a draw offset:
-   * a lattice-aligned texel cannot express a cell painted off its own index.
+   * Offsets are accepted in exactly one shape: the SAME one on every cell.
+   *
+   * A per-cell offset is content — this cell went somewhere that one did not —
+   * and a lattice-aligned texel cannot express it, so the per-cell walk has to
+   * take that plane. But one offset shared by the whole plane is not content,
+   * it is the layer sliding: a scroll, a parallax. Nothing about the plane's
+   * internal arrangement changed, so it costs a translation of the two blits
+   * and nothing else.
+   *
+   * The seam this leaves is at the lattice EDGE. A shared offset moves the
+   * fabric off its own boundary by up to the offset, and there is no cell
+   * beyond row -1 to fill what it uncovers, so the outermost row or column is
+   * cut by that much. Keep the shared offset inside half a step — a consumer
+   * scrolling should hand over whole cells plus the remainder, the way the
+   * lattice expects — and the seam stays under half a cell at the border.
    *
    * @private
    * @returns {boolean} true if the plane was painted here
@@ -207,14 +220,19 @@ export class Renderer {
     const data = img.data
     data.fill(0)
 
-    let anyOffset = false
+    let mixed = false
     let live = 0
+    let shiftX = 0
+    let shiftY = 0
     this.fields.forEachCell((gx, gy, alpha, color, offX, offY) => {
-      if (offX !== 0 || offY !== 0) {
-        anyOffset = true
+      if (alpha <= 0) return
+      if (live === 0) {
+        shiftX = offX
+        shiftY = offY
+      } else if (offX !== shiftX || offY !== shiftY) {
+        mixed = true
         return
       }
-      if (alpha <= 0) return
       const j = (gy * cols + gx) * 4
       data[j] = (color >> 16) & 0xff
       data[j + 1] = (color >> 8) & 0xff
@@ -222,7 +240,7 @@ export class Renderer {
       data[j + 3] = alpha >= 1 ? 255 : (alpha * 255 + 0.5) | 0
       live++
     })
-    if (anyOffset) return false
+    if (mixed) return false
     if (live === 0) return true // plane is already clear; nothing to cut
 
     const dpr = layout.dpr
@@ -238,13 +256,15 @@ export class Renderer {
     pctx.drawImage(
       map,
       0, 0, cols, rows,
-      layout.originX - half, layout.originY - half,
+      layout.originX - half + shiftX, layout.originY - half + shiftY,
       cols * layout.step_, rows * layout.step_
     )
-    // The mask is already at device resolution, so it goes on untransformed.
+    // The mask is already at device resolution, so it goes on untransformed —
+    // and it has to carry the SAME shift, or the cell shapes would stay put
+    // while their colours slid out from under them.
     pctx.globalCompositeOperation = 'destination-in'
     pctx.setTransform(1, 0, 0, 1, 0, 0)
-    pctx.drawImage(mask, 0, 0)
+    pctx.drawImage(mask, shiftX * dpr, shiftY * dpr)
     pctx.globalCompositeOperation = 'source-over'
     pctx.imageSmoothingEnabled = smoothing
     return true
