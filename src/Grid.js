@@ -31,17 +31,17 @@ export class Grid {
    *   that are keyed by block.index or countX/countY.
    * @param {number} [options.minCountX]
    * @param {number} [options.minCountY]
-   * @param {number} [options.fieldHeight] - see Layout; blocks span this
-   *   vertical extent instead of the canvas's CSS height. Use for
-   *   document-space grids that scroll through a viewport-sized canvas.
-   * @param {number} [options.fieldWidth] - see Layout.
+   * @param {number} options.fieldHeight - REQUIRED. The document's full
+   *   scroll height; the lattice spans it. See Layout.
+   * @param {number} options.fieldWidth - REQUIRED. The page's content width.
    * @param {Object<string, HTMLCanvasElement>} [options.planes] - extra raster
    *   targets keyed by name, e.g. `{ over: canvasEl }`. A Field picks one via
    *   `plane`; anything not named lands on `container` ('base'). All planes
    *   share ONE Layout, so the lattice, its origin and its phase are identical
    *   across them — the split is purely about where in the page's stacking
    *   order the cells are painted, which is what lets DOM content be
-   *   sandwiched between fields. The consumer positions the canvases.
+   *   sandwiched between fields. The consumer positions the canvases and
+   *   declares which band of the document each covers, via `setPlaneBox`.
    */
   constructor({ container, blockSize, countX, countY, step, fieldHeight, fieldWidth, minCountX, minCountY, cornerRadius = 0, planes = null }) {
     /** @private @type {Array<() => void>} */
@@ -50,8 +50,9 @@ export class Grid {
     // Extra raster planes, keyed by name, so a Field can declare which canvas
     // it lands on. `container` is always 'base'. This exists for exactly one
     // reason: page content has to be able to sit BETWEEN two fields, and one
-    // canvas cannot express that. See Field.plane.
-    const mirrors = planes ? Object.keys(planes).filter((k) => k !== 'base' && planes[k]).map((k) => planes[k]) : []
+    // canvas cannot express that. See Field.plane. Layout no longer sees them:
+    // planes do not share a size any more — each covers its own band — so
+    // there is nothing left to mirror.
 
     /** @private @type {Layout} */
     this._layout = new Layout({
@@ -64,7 +65,6 @@ export class Grid {
       fieldWidth,
       minCountX,
       minCountY,
-      mirrors,
     })
     // Layout may have derived counts from step + container size, so pull
     // the authoritative values back out.
@@ -147,8 +147,10 @@ export class Grid {
   }
 
   /**
-   * The lattice geometry fields need in order to place themselves.
-   * @returns {{cols:number, rows:number, step:number, blockSize:number, gap:number, originX:number, originY:number}}
+   * The lattice geometry fields need in order to place themselves. All of it
+   * is DOCUMENT space: `originY` is measured from the top of the page, and a
+   * row index means the same document position no matter what is on screen.
+   * @returns {{cols:number, rows:number, step:number, blockSize:number, gap:number, originX:number, originY:number, docHeight:number}}
    */
   get lattice() {
     const l = this._layout
@@ -160,7 +162,23 @@ export class Grid {
       gap: l.gap,
       originX: l.originX,
       originY: l.originY,
+      docHeight: l.fieldHeight,
     }
+  }
+
+  /**
+   * Where a plane's canvas sits in the document, in CSS px. The renderer
+   * translates by this, so a cell lands at its document position no matter
+   * which band rasterises it — and sizes the canvas's backing store to match.
+   *
+   * A resize-time fact. It does not change when the page scrolls, which is
+   * the entire reason the lattice moved into document space.
+   *
+   * @param {string} name plane name; 'base' is the container canvas
+   * @param {{top: number, height: number}} box
+   */
+  setPlaneBox(name, box) {
+    this._renderer.setPlaneBox(name, box)
   }
 
   /**

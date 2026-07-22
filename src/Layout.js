@@ -2,10 +2,17 @@
  * Computes block positions, gap, and handles resize.
  * Knows nothing about rendering or animations.
  *
- * Owns a ResizeObserver on the container so layout stays in sync
- * with the element's rendered size. Consumers (e.g. Renderer) just
- * read `blocks`, `width`, `height` each frame — no subscription
- * needed.
+ * THE LATTICE IS DOCUMENT SPACE. `fieldWidth`/`fieldHeight` are the page's
+ * content width and its full scroll height, and they are the only inputs to
+ * the solve — no canvas is measured for geometry any more. The canvases that
+ * rasterise the lattice each cover a BAND of the document, and the Renderer
+ * translates into its band; sizing them is its job, not this class's.
+ *
+ * That is the whole point of the arrangement. A lattice defined against the
+ * viewport has to be re-placed every frame from a scroll position the main
+ * thread learns about a frame late, which is a visible slip between the cells
+ * and the content they are locked to. Document coordinates have no scroll
+ * term, so there is nothing to be late about.
  */
 export class Layout {
   /**
@@ -17,30 +24,25 @@ export class Layout {
    * @param {number} [params.step] - target block+gap step in px. When set,
    *   countX/countY are derived from container size on every recalculate,
    *   so the grid re-tiles itself on window resize.
-   * @param {number} [params.fieldHeight] - optional override for the
-   *   vertical extent used to compute block positions + countY. Defaults
-   *   to the container's CSS height. Set this when the consumer wants
-   *   blocks to span beyond the visible canvas (e.g. covering the full
-   *   document height so they scroll with the page). Does NOT change
-   *   canvas intrinsic size — the renderer still draws only into the
-   *   viewport-sized canvas.
-   * @param {number} [params.fieldWidth] - same idea for the horizontal axis.
+   * @param {number} params.fieldHeight - REQUIRED. The document's full
+   *   scroll height. The lattice spans it, so `countY` is a document row
+   *   count, not a viewport one.
+   * @param {number} params.fieldWidth - REQUIRED. The page's content width.
    * @param {number} [params.minCountX=8]
    * @param {number} [params.minCountY=8]
    */
-  constructor({ container, blockSize, countX, countY, step, fieldHeight, fieldWidth, minCountX, minCountY, mirrors = [] }) {
-    /** @type {HTMLCanvasElement} */
+  constructor({ container, blockSize, countX, countY, step, fieldHeight, fieldWidth, minCountX, minCountY }) {
+    /**
+     * Kept only so the ResizeObserver has something to watch. Nothing about
+     * the lattice is derived from it.
+     * @type {HTMLCanvasElement}
+     */
     this.container = container
-    // Extra plane canvases. They are never measured — `container` alone is
-    // the authority on size — they are only kept at the same backing-store
-    // resolution, so one lattice rasterises identically onto all of them.
-    /** @type {HTMLCanvasElement[]} */
-    this.mirrors = mirrors
     /** @type {number} */
     this.blockSize = blockSize
     /** @type {number|undefined} auto-count driver (block+gap target) */
     this.step = step
-    /** @type {number|undefined} field dim overrides (see ctor JSDoc) */
+    /** @type {number} the document extent the lattice spans (see ctor JSDoc) */
     this.fieldHeight = fieldHeight
     this.fieldWidth = fieldWidth
     /** @type {number} */
@@ -77,9 +79,14 @@ export class Layout {
     this.gapX = 0
     this.gapY = 0
 
-    /** @type {number} CSS pixel width */
+    /**
+     * @deprecated The container's measured CSS box. It is no longer the
+     * lattice's authority — `fieldWidth`/`fieldHeight` are — and the Renderer
+     * is being moved off it onto per-plane bands. Nothing new should read it.
+     * @type {number} CSS pixel width
+     */
     this.width = 0
-    /** @type {number} CSS pixel height */
+    /** @deprecated see `width`. @type {number} CSS pixel height */
     this.height = 0
 
     /** @type {number} current devicePixelRatio (clamped to 2) */
@@ -157,49 +164,19 @@ export class Layout {
     const rawDpr = typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1
     this.dpr = Math.min(rawDpr, 2)
 
-    // Canvas intrinsic resolution = CSS size × DPR for sharp rendering
-    // on high-density displays. Block positions stay in CSS pixels;
-    // the Renderer applies the DPR scale transform before drawing.
-    this.container.width = Math.round(this.width * this.dpr)
-    this.container.height = Math.round(this.height * this.dpr)
-    for (let i = 0; i < this.mirrors.length; i++) {
-      const m = this.mirrors[i]
-      if (!m) continue
-      m.width = this.container.width
-      m.height = this.container.height
-    }
+    // Canvas intrinsic size is NOT written here. Each plane's canvas covers a
+    // band of the document and only the Renderer knows which band, so it sizes
+    // them (Renderer.setPlaneBox). Writing an intrinsic size from a measured
+    // one is also what made the old runaway loop possible — the warning that
+    // guarded it moved to the Renderer with the write.
 
-    // Runaway guard, once per Layout. <canvas> is a REPLACED element: with
-    // `width: auto` its CSS size is its INTRINSIC size, so `position: fixed;
-    // inset: 0` (or any absolute box) does NOT stretch it. Since the line above
-    // writes the intrinsic size, an unconstrained canvas immediately reports a
-    // larger rect to the ResizeObserver, which recalculates, which writes a
-    // larger intrinsic size — the canvas grows by a factor of `dpr` every pass
-    // until the cell count melts the frame. There is no exception thrown and
-    // nothing in the output points at CSS, so detect it and say so.
-    if (!this._sizeChecked) {
-      this._sizeChecked = true
-      const after = this.container.getBoundingClientRect()
-      if (Math.abs(after.width - this.width) > 1 || Math.abs(after.height - this.height) > 1) {
-        console.warn(
-          '[densitygrid] The canvas has no CSS size, so it is sizing itself from ' +
-          'its width/height attributes and will grow without bound. Give it an ' +
-          'explicit CSS size (e.g. `width:100vw;height:100vh` or `width:100%;height:100%`) — ' +
-          '`position:fixed;inset:0` alone is not enough for a replaced element. ' +
-          `Measured ${this.width}x${this.height}, became ${after.width}x${after.height}.`
-        )
-      }
-    }
-
-    // When fieldWidth / fieldHeight are provided, use them for block
-    // layout (count derivation + gap + block positions). Canvas
-    // intrinsic size still follows the container rect above — consumers
-    // use this to make blocks span a document-sized area while the
-    // canvas stays pinned to the viewport (e.g. blocks scroll with the
-    // page through an offsetPosition animation, while the canvas layer
-    // stays position:fixed).
-    const effW = this.fieldWidth != null ? this.fieldWidth : this.width
-    const effH = this.fieldHeight != null ? this.fieldHeight : this.height
+    // The lattice is document space, and these are its only inputs. No
+    // fallback to the measured canvas: a canvas is a band now, and solving the
+    // lattice against a band would make the lattice depend on which slice of
+    // the page happens to be rasterised.
+    const effW = this.fieldWidth
+    const effH = this.fieldHeight
+    if (!(effW > 0) || !(effH > 0)) return
 
     // --- Lattice solve --------------------------------------------------
     // Requirements, in priority order: square cells · ONE gap value used on
@@ -246,11 +223,14 @@ export class Layout {
     const topologyChanged =
       this.countX !== prevCountX || this.countY !== prevCountY
 
-    // Center the vertical remainder as outer margin so the field is not
-    // bottom-biased. Horizontally the solve is exact, so the margin IS the gap.
-    const usedH = this.countY * this.blockSize + (this.countY + 1) * this.gap
+    // Both origins are the gap, flat. The vertical remainder used to be split
+    // as outer margin so a viewport-tall field would not sit bottom-biased;
+    // there is no such thing as centring a field that is the whole document,
+    // and a centring term would put row 0 at an offset that changes whenever
+    // the page grows a paragraph. originY is a document coordinate: row 0 is
+    // one gap below the top of the page, and stays there.
     this.originX = this.gap
-    this.originY = this.gap + Math.max(0, (effH - usedH) / 2)
+    this.originY = this.gap
 
     const centerCol = (this.countX - 1) / 2
     const centerRow = (this.countY - 1) / 2
@@ -354,6 +334,10 @@ export class Layout {
   }
 
   /**
+   * The container is watched for DPR-adjacent churn and as a cheap signal
+   * that the page reflowed. It is NOT how the lattice learns its size: the
+   * document extent is not observable from one canvas, so the consumer pushes
+   * it in with `reconfigure({ fieldWidth, fieldHeight })`.
    * @private
    */
   _observeResize() {
