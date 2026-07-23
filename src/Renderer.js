@@ -1,25 +1,14 @@
 /**
- * Owns the requestAnimationFrame loop. Each tick it walks the
- * layout's block list, asks the AnimationStack for per-block
- * offsets, and draws the result to the canvas 2D context.
+ * Owns the requestAnimationFrame loop. Each tick it asks the FieldStack to
+ * compose the registered fields into a cell surface, once per plane, and
+ * draws the result.
  *
- * The loop is always running once start() is called — an empty
- * stack still produces a valid base-state frame (opaque white
- * blocks at their layout positions).
- *
- * Priority rule (CLAUDE.md §6): for each property (opacity,
- * position), if an offset contribution is present, it wins over
- * any absolute override. Absolute only applies when no offset
- * was provided.
+ * @param {Object} params
+ * @param {HTMLCanvasElement} params.container
+ * @param {Layout} params.layout
  */
 export class Renderer {
-  /**
-   * @param {Object} params
-   * @param {HTMLCanvasElement} params.container
-   * @param {Layout} params.layout
-   * @param {AnimationStack} params.stack
-   */
-  constructor({ container, layout, stack, fields = null, cornerRadius = 0, planes = null, composite = true }) {
+  constructor({ container, layout, fields = null, cornerRadius = 0, planes = null, composite = true }) {
     /** @type {HTMLCanvasElement} */
     this.container = container
     /** @type {CanvasRenderingContext2D} */
@@ -50,8 +39,6 @@ export class Renderer {
     }
     /** @type {Layout} */
     this.layout = layout
-    /** @type {AnimationStack} */
-    this.stack = stack
     /** @type {import('./Field.js').FieldStack|null} */
     this.fields = fields
     /** @type {number} block corner radius in px (0 = square corners) */
@@ -642,175 +629,107 @@ export class Renderer {
   }
 
   /**
-   * Clear + draw one frame. Pulls evaluated offsets from the stack
-   * and applies them on top of base state (opacity 1, white).
+   * Compose and draw one frame, per plane.
+   *
+   * Cells arrive from the FieldStack already resolved — which field won a
+   * contested cell, blended or not — so drawing is a flat walk with no
+   * per-cell decision left to make.
    *
    * @param {number} now
    * @private
    */
   _draw(now) {
-    const ctx = this.ctx
     const layout = this.layout
-    const stack = this.stack
     const blockSize = layout.blockSize
-    const blocks = layout.blocks
     const dpr = layout.dpr
+    if (!this.fields) return
 
-    // Field path. Cells come out of the compositor already resolved (which
-    // field won, blended or not), so drawing is a flat walk with no per-block
-    // animation evaluation. The legacy block path below stays for as long as
-    // the old pull-model animations are still in use.
-    if (this.fields && this.fields.size > 0) {
-      const step = layout.step_
-      const ox = layout.originX
-      const r = this.cornerRadius
+    const step = layout.step_
+    const ox = layout.originX
+    const r = this.cornerRadius
 
-      // One compose + one draw per plane. Planes are independent raster
-      // targets over ONE lattice — a cell index means the same cell on every
-      // plane, so a field that moves from one to another lands pixel-identical.
-      for (let p = 0; p < this.planes.length; p++) {
-        const plane = this.planes[p]
-        const pctx = plane.ctx
-        const box = this._ensureBox(plane)
-        if (!(box.height > 0)) continue
+    // One compose + one draw per plane. Planes are independent raster
+    // targets over ONE lattice — a cell index means the same cell on every
+    // plane, so a field that moves from one to another lands pixel-identical.
+    for (let p = 0; p < this.planes.length; p++) {
+      const plane = this.planes[p]
+      const pctx = plane.ctx
+      const box = this._ensureBox(plane)
+      if (!(box.height > 0)) continue
 
-        // The lattice is document space and this canvas is a band of it, so
-        // every y is written band-local. There is no scroll term anywhere in
-        // here — that is the point of the arrangement.
-        const oy = layout.originY - box.top
+      // The lattice is document space and this canvas is a band of it, so
+      // every y is written band-local. There is no scroll term anywhere in
+      // here — that is the point of the arrangement.
+      const oy = layout.originY - box.top
 
-        pctx.fillStyle = '#FFFFFF'
-        let planeFill = '#FFFFFF'
+      pctx.fillStyle = '#FFFFFF'
+      let planeFill = '#FFFFFF'
 
-        this.fields.compose(layout.countX, layout.countY, now, plane.name)
+      this.fields.compose(layout.countX, layout.countY, now, plane.name)
 
-        // ONE PREDICATE CHOOSES THE BACKEND, and it is the same one the
-        // two-blit path has always evaluated: did any cell ask to be drawn
-        // somewhere its lattice index does not put it?
-        //
-        //   no displacement at all → the compositor can hold the plane (CSS)
-        //   one shared displacement → two blits, the layer sliding as a whole
-        //   per-cell displacement   → the walk; nothing else can express it
-        const m = this._buildMap(layout)
+      // ONE PREDICATE CHOOSES THE BACKEND, and it is the same one the
+      // two-blit path has always evaluated: did any cell ask to be drawn
+      // somewhere its lattice index does not put it?
+      //
+      //   no displacement at all → the compositor can hold the plane (CSS)
+      //   one shared displacement → two blits, the layer sliding as a whole
+      //   per-cell displacement   → the walk; nothing else can express it
+      const m = this._buildMap(layout)
 
-        if (m.live === 0) {
-          // Nothing lit. Clear whatever this plane currently is and DO NOT
-          // commit to a backend — a plane whose section has not scrolled into
-          // view yet would otherwise adopt the composited layout and then
-          // visibly change its mind on the frame its cells arrive.
-          pctx.setTransform(1, 0, 0, 1, 0, 0)
-          pctx.clearRect(0, 0, plane.canvas.width, plane.canvas.height)
-          continue
-        }
-
-        if (plane.mode === 'composite') {
-          if (!m.mixed && m.shiftX === 0 && m.shiftY === 0) {
-            this._paintPlaneComposite(plane, layout, box, oy, m.live)
-            continue
-          }
-          this._demote(plane)
-        }
-
-        if (this._paintPlaneFast(pctx, layout, box, oy, m)) {
-          pctx.setTransform(1, 0, 0, 1, 0, 0)
-          continue
-        }
-
-        // The fast path clears as a side effect of its final `source-in`; the
-        // per-cell walk has no such operator, so it clears for itself.
+      if (m.live === 0) {
+        // Nothing lit. Clear whatever this plane currently is and DO NOT
+        // commit to a backend — a plane whose section has not scrolled into
+        // view yet would otherwise adopt the composited layout and then
+        // visibly change its mind on the frame its cells arrive.
         pctx.setTransform(1, 0, 0, 1, 0, 0)
         pctx.clearRect(0, 0, plane.canvas.width, plane.canvas.height)
-        pctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+        continue
+      }
 
-        this.fields.forEachCell((gx, gy, alpha, color, offX, offY) => {
-          if (alpha <= 0) return
-          const fill =
-            color === 0xffffff
-              ? '#FFFFFF'
-              : `rgb(${(color >> 16) & 0xff},${(color >> 8) & 0xff},${color & 0xff})`
-          if (fill !== planeFill) {
-            pctx.fillStyle = fill
-            planeFill = fill
-          }
-          pctx.globalAlpha = alpha > 1 ? 1 : alpha
-          // offX/offY: sub-cell DRAW displacement — composition stayed on the
-          // lattice, only the paint slides.
-          const x = ox + gx * step + offX
-          const y = oy + gy * step + offY
-          if (r > 0) {
-            pctx.beginPath()
-            pctx.roundRect(x, y, blockSize, blockSize, r)
-            pctx.fill()
-          } else {
-            pctx.fillRect(x, y, blockSize, blockSize)
-          }
-        })
-        pctx.globalAlpha = 1
+      if (plane.mode === 'composite') {
+        if (!m.mixed && m.shiftX === 0 && m.shiftY === 0) {
+          this._paintPlaneComposite(plane, layout, box, oy, m.live)
+          continue
+        }
+        this._demote(plane)
+      }
+
+      if (this._paintPlaneFast(pctx, layout, box, oy, m)) {
         pctx.setTransform(1, 0, 0, 1, 0, 0)
+        continue
       }
-      return
+
+      // The fast path clears as a side effect of its final `source-in`; the
+      // per-cell walk has no such operator, so it clears for itself.
+      pctx.setTransform(1, 0, 0, 1, 0, 0)
+      pctx.clearRect(0, 0, plane.canvas.width, plane.canvas.height)
+      pctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+
+      this.fields.forEachCell((gx, gy, alpha, color, offX, offY) => {
+        if (alpha <= 0) return
+        const fill =
+          color === 0xffffff
+            ? '#FFFFFF'
+            : `rgb(${(color >> 16) & 0xff},${(color >> 8) & 0xff},${color & 0xff})`
+        if (fill !== planeFill) {
+          pctx.fillStyle = fill
+          planeFill = fill
+        }
+        pctx.globalAlpha = alpha > 1 ? 1 : alpha
+        // offX/offY: sub-cell DRAW displacement — composition stayed on the
+        // lattice, only the paint slides.
+        const x = ox + gx * step + offX
+        const y = oy + gy * step + offY
+        if (r > 0) {
+          pctx.beginPath()
+          pctx.roundRect(x, y, blockSize, blockSize, r)
+          pctx.fill()
+        } else {
+          pctx.fillRect(x, y, blockSize, blockSize)
+        }
+      })
+      pctx.globalAlpha = 1
+      pctx.setTransform(1, 0, 0, 1, 0, 0)
     }
-
-    // Legacy per-block path. It never learned about planes or bands, so it
-    // still owns the container outright and clears it whole.
-    ctx.setTransform(1, 0, 0, 1, 0, 0)
-    ctx.clearRect(0, 0, this.container.width, this.container.height)
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
-    let lastFill = '#FFFFFF'
-    ctx.fillStyle = '#FFFFFF'
-
-    for (let i = 0; i < blocks.length; i++) {
-      const block = blocks[i]
-      const offsets = stack.evaluate(block, now)
-
-      // --- Opacity: offset wins over absolute ---
-      // Base opacity is 1. If any animation contributed an
-      // opacityOffset, apply it on top of base. Otherwise, if
-      // an absoluteOpacity is present, use it verbatim.
-      let opacity
-      const opacityOffset = offsets.opacityOffset || 0
-      if (opacityOffset !== 0) {
-        opacity = 1 + opacityOffset
-      } else if (
-        offsets.absoluteOpacity !== null &&
-        offsets.absoluteOpacity !== undefined
-      ) {
-        opacity = offsets.absoluteOpacity
-      } else {
-        opacity = 1
-      }
-      if (opacity < 0) opacity = 0
-      else if (opacity > 1) opacity = 1
-
-      if (opacity <= 0) continue
-
-      // --- Position: offset wins over absolute ---
-      let x = block.x
-      let y = block.y
-      const offPos = offsets.offsetPosition
-      const offX = offPos ? offPos.x || 0 : 0
-      const offY = offPos ? offPos.y || 0 : 0
-      if (offX !== 0 || offY !== 0) {
-        x = block.x + offX
-        y = block.y + offY
-      } else if (offsets.absolutePosition) {
-        x = offsets.absolutePosition.x
-        y = offsets.absolutePosition.y
-      }
-
-      // --- Color: per-block override, falls back to white base ---
-      const c = offsets.color
-      const fill = c ? `rgb(${c.r},${c.g},${c.b})` : '#FFFFFF'
-      if (fill !== lastFill) {
-        ctx.fillStyle = fill
-        lastFill = fill
-      }
-
-      ctx.globalAlpha = opacity
-      ctx.fillRect(x, y, blockSize, blockSize)
-    }
-
-    ctx.globalAlpha = 1
-    ctx.setTransform(1, 0, 0, 1, 0, 0)
   }
 }

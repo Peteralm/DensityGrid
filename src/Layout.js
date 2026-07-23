@@ -56,8 +56,8 @@ export class Layout {
 
     /**
      * Fires after recalculate() when countX or countY changed. Set by
-     * Grid so it can refresh its public totals and notify consumers
-     * (ScrollReveal, gridBridge subscribers) on resize-driven re-tiling.
+     * Grid so it can refresh its public totals and notify consumers on
+     * resize-driven re-tiling.
      * @type {(() => void)|null}
      */
     this._onTopologyChange = null
@@ -75,37 +75,15 @@ export class Layout {
     /** @type {number} */
     this.originY = 0
 
-    /** @deprecated aliases of `gap` — the two axes can no longer diverge. */
-    this.gapX = 0
-    this.gapY = 0
-
-    /**
-     * @deprecated The container's measured CSS box. It is no longer the
-     * lattice's authority — `fieldWidth`/`fieldHeight` are — and the Renderer
-     * is being moved off it onto per-plane bands. Nothing new should read it.
-     * @type {number} CSS pixel width
-     */
-    this.width = 0
-    /** @deprecated see `width`. @type {number} CSS pixel height */
-    this.height = 0
-
     /** @type {number} current devicePixelRatio (clamped to 2) */
     const _initialDpr = typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1
     this.dpr = Math.min(_initialDpr, 2)
 
-    /**
-     * Flat array of block descriptors. Shape per CLAUDE.md §6.
-     * Positions are in CSS pixels — the Renderer handles DPR scaling.
-     * @type {Array<{
-     *   col: number,
-     *   row: number,
-     *   x: number,
-     *   y: number,
-     *   index: number,
-     *   distFromCenter: number,
-     * }>}
-     */
-    this.blocks = []
+    // THERE IS NO BLOCK LIST. This class used to materialise one descriptor
+    // object per cell here — 24,786 of them on a full page, rebuilt on every
+    // resize — for a per-block pull model that the field path had already made
+    // unreachable. A cell's position is `origin + index * step`, which is
+    // cheaper to compute than to look up; the array was pure rent.
 
     /** @type {ResizeObserver|null} */
     this._ro = null
@@ -121,14 +99,6 @@ export class Layout {
     this._observeDpr()
   }
 
-  /**
-   * Recompute container size, gap, and block positions. Also syncs
-   * the canvas's intrinsic width/height to its rendered size so
-   * pixel coordinates match 1:1.
-   *
-   * Gap formula (per task spec):
-   *   gap = (containerSize - count * blockSize) / (count + 1)
-   */
   /**
    * Update grid parameters and recalculate. Any parameter not provided
    * keeps its current value. Returns true if totalBlocks changed
@@ -154,9 +124,10 @@ export class Layout {
   }
 
   recalculate(opts = {}) {
-    const rect = this.container.getBoundingClientRect()
-    this.width = rect.width
-    this.height = rect.height
+    // The container is NOT measured. It used to be, for a `width`/`height`
+    // pair nothing reads any more — and measuring it here meant a forced
+    // layout on every DPR event and every ResizeObserver tick, to fill two
+    // fields that had already stopped being the lattice's authority.
     // DPR clamped to 2 to match prototype behavior — on 3x/4x displays the
     // cost of rendering at native density isn't worth the extra sharpness
     // for a field of 20px blocks, and canvas.width hits backing-store limits
@@ -213,8 +184,6 @@ export class Layout {
     this.gap = (effW - this.countX * this.blockSize) / (this.countX + 1)
     if (!(this.gap >= 0)) this.gap = 0 // NaN / negative guard
     this.step_ = this.blockSize + this.gap
-    this.gapX = this.gap
-    this.gapY = this.gap
 
     if (this.step && this.step > 0) {
       const fit = this.step_ > 0 ? Math.floor((effH - this.gap) / this.step_) : this.minCountY
@@ -232,48 +201,12 @@ export class Layout {
     this.originX = this.gap
     this.originY = this.gap
 
-    const centerCol = (this.countX - 1) / 2
-    const centerRow = (this.countY - 1) / 2
-    const maxDist = Math.sqrt(centerCol * centerCol + centerRow * centerRow)
-
-    const blocks = new Array(this.countX * this.countY)
-    let i = 0
-    for (let row = 0; row < this.countY; row++) {
-      for (let col = 0; col < this.countX; col++) {
-        const x = this.originX + col * this.step_
-        const y = this.originY + row * this.step_
-
-        const dx = col - centerCol
-        const dy = row - centerRow
-        const dist = Math.sqrt(dx * dx + dy * dy)
-        const distFromCenter = maxDist > 0 ? dist / maxDist : 0
-
-        blocks[i] = {
-          col,
-          row,
-          x,
-          y,
-          index: i,
-          distFromCenter,
-        }
-        i++
-      }
-    }
-    this.blocks = blocks
-
     // Notify Grid of topology change driven by ResizeObserver / DPR
     // events. `silent` is set by reconfigure() which routes the
     // notification through Grid.reconfigure() instead.
     if (topologyChanged && !opts.silent && typeof this._onTopologyChange === 'function') {
       this._onTopologyChange()
     }
-  }
-
-  /**
-   * @returns {number} total number of blocks (countX * countY)
-   */
-  getTotalBlocks() {
-    return this.countX * this.countY
   }
 
   /**

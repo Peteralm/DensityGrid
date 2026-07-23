@@ -1,22 +1,29 @@
 import { Layout } from './Layout.js'
 import { Renderer } from './Renderer.js'
-import { AnimationStack } from './AnimationStack.js'
-import { AnimationController } from './AnimationController.js'
-import { ScrollReveal } from './ScrollReveal.js'
 import { Field, FieldStack } from './Field.js'
 
 /**
- * Main grid class. Wires up Layout, AnimationStack, and Renderer
- * and exposes the public API described in CLAUDE.md §6.
+ * Main grid class. Wires up Layout, FieldStack and Renderer and exposes the
+ * public API described in CLAUDE.md §6.
  *
  * Instances are created through createGrid() in index.js — consumers
  * (e.g. gridBridge.js in the site project) should never new this
  * class directly.
  *
+ * THERE IS ONE MODEL: fields PUSH cells. A producer calls `write()` for the
+ * cells it occupies and the FieldStack resolves the contested ones. The
+ * library used to carry a second, PULL model as well — a per-block animation
+ * stack that the renderer walked every frame, asking each of ~25k block
+ * descriptors what it looked like now — and it had been unreachable for some
+ * time: registering a single Field switched the renderer onto the field path
+ * and the block path was never taken again. It was removed rather than fixed,
+ * because two models is the actual defect. Its cost was not hypothetical: a
+ * descriptor array rebuilt on every resize, for a path nothing could run.
+ *
  * Ownership:
- *   Grid owns Layout, AnimationStack, and Renderer. Layout owns its
- *   own ResizeObserver. Renderer owns the rAF loop. Grid just wires
- *   them together and surfaces the public API.
+ *   Grid owns Layout, FieldStack and Renderer. Layout owns its own
+ *   ResizeObserver. Renderer owns the rAF loop. Grid just wires them
+ *   together and surfaces the public API.
  */
 export class Grid {
   /**
@@ -86,57 +93,35 @@ export class Grid {
 
     // Wire topology-change notifications from Layout → Grid so a window
     // resize (or DPR change that alters derived counts) refreshes the
-    // public totals, re-inits ScrollReveal, and fans out to subscribers.
+    // public totals and fans out to subscribers.
     this._layout._onTopologyChange = () => this._handleTopologyChange()
-    /** @private @type {AnimationStack} */
-    this._stack = new AnimationStack()
     /** @private @type {FieldStack} */
     this._fields = new FieldStack()
     /** @private @type {Renderer} */
     this._renderer = new Renderer({
       container,
       layout: this._layout,
-      stack: this._stack,
       fields: this._fields,
       cornerRadius,
       planes,
       composite,
     })
 
-    // Public debug namespace. Frozen so consumers can safely
-    // destructure (e.g. const { list, filter } = grid.debug).
-    const stack = this._stack
+    // Public debug namespace. Frozen so consumers can safely destructure.
     const fieldStack = this._fields
-    /** @type {{ list: () => Array<{name:string,status:string}>, filter: (names: string[]|null) => void, fields: () => Array<Object> }} */
+    /** @type {{ fields: () => Array<Object> }} */
     this.debug = Object.freeze({
-      list: () => stack.list(),
-      filter: (names) => stack.setFilter(names),
       fields: () => fieldStack.list(),
     })
 
-    // Start the render loop immediately. An empty stack still
-    // produces a valid base-state frame (opaque white blocks).
+    // Start the render loop immediately. With no fields registered it draws
+    // an empty frame, which is the correct picture of an empty lattice.
     this._renderer.start()
-  }
-
-  /**
-   * Register a new animation. Returns a controller in IDLE state —
-   * call controller.play() to start it.
-   *
-   * @param {string} name
-   * @param {(block: Object, time: number) => Object} fn
-   * @returns {AnimationController}
-   */
-  registerAnimation(name, fn) {
-    return new AnimationController({ name, fn, stack: this._stack })
   }
 
   /**
    * Register a Field — a region of the lattice with its own producer,
    * stacking order and merge rule. See Field.js.
-   *
-   * Registering the first field switches the renderer onto the field path;
-   * the legacy per-block animation stack stops being drawn.
    *
    * @param {Object} params - see the Field constructor
    * @returns {Field}
@@ -204,20 +189,17 @@ export class Grid {
   }
 
   /**
-   * Change grid parameters (blockSize, countX, countY) without
-   * destroying running animations. Positions are recalculated,
-   * the canvas is resized, but the AnimationStack keeps running
-   * — time continues, PAUSED caches stay valid for blocks that
-   * still exist, and new blocks appear at base state.
-   *
-   * If totalBlocks changed and ScrollReveal is active, it
-   * reinitializes its row metadata (unseen rows will re-reveal
-   * on scroll; already-revealed rows stay revealed).
+   * Re-solve the lattice. Fields are untouched: they are keyed by cell, so a
+   * new topology simply means their producers write into a different number
+   * of cells on the next frame. Anything the CONSUMER keys by cell has to
+   * rebuild itself, which is what `onResize` is for.
    *
    * @param {Object} params
    * @param {number} [params.blockSize]
    * @param {number} [params.countX]
    * @param {number} [params.countY]
+   * @param {number} [params.fieldWidth]
+   * @param {number} [params.fieldHeight]
    */
   reconfigure(params) {
     const topologyChanged = this._layout.reconfigure(params)
@@ -226,7 +208,6 @@ export class Grid {
     this.countY = this._layout.countY
     this.totalBlocks = this.countX * this.countY
     if (topologyChanged) {
-      if (this._scrollReveal) this._scrollReveal._onLayoutChange()
       this._fireResize()
     }
     // Setting canvas.width/height inside layout.reconfigure() clears the
@@ -301,7 +282,6 @@ export class Grid {
     this.countX = this._layout.countX
     this.countY = this._layout.countY
     this.totalBlocks = this.countX * this.countY
-    if (this._scrollReveal) this._scrollReveal._onLayoutChange()
     this._fireResize()
     // Layout just resized canvas.width/height → canvas cleared. Redraw now
     // instead of waiting for the next rAF (visible gap during drag-resize).
@@ -318,22 +298,5 @@ export class Grid {
         // Swallow: one bad subscriber shouldn't block the others.
       }
     }
-  }
-
-  /**
-   * Enable scroll-driven row reveal. Blocks start invisible and
-   * animate in row-by-row as they enter the viewport, with a
-   * left-to-right stagger per column.
-   *
-   * @param {Object} [options]
-   * @param {number} [options.staggerDelay=6] - ms delay between columns
-   * @param {number} [options.riseDuration=35] - ms per block rise
-   * @param {number} [options.slideRatio=0.55] - horizontal slide factor
-   * @returns {ScrollReveal}
-   */
-  enableScrollReveal(options) {
-    if (this._scrollReveal) this._scrollReveal.destroy()
-    this._scrollReveal = new ScrollReveal(this, options)
-    return this._scrollReveal
   }
 }
