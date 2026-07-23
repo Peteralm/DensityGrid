@@ -29,7 +29,21 @@
  * plane carries its own — three of them, against a browser limit around
  * sixteen. Collapsing to one context with framebuffer targets is possible and
  * is NOT done: it is more machine than the problem currently has.
+ *
+ * THE RASTER TARGET IS THE VIEWPORT, not the document. A plane's canvas is a
+ * window a little taller than the screen that slides inside the section it
+ * serves. Sizing it to the section instead was measured and rejected: the
+ * `over` plane alone allocated 29.8MB of backing store, roughly 62% of it
+ * never on screen, and that number GROWS with every section the page gains.
+ * A viewport window is O(screen) forever.
  */
+
+/**
+ * Extra cell rows kept on each side of the screen. It is a buffer against the
+ * band being chosen one frame late during a fast fling — the failure mode is
+ * an unpainted strip, never a misplaced cell.
+ */
+const MARGIN = 4
 
 const VERT = `#version 300 es
 layout(location=0) in vec2 corner;   // unit quad, -0.5..0.5
@@ -133,8 +147,11 @@ export class Renderer {
       canvas,
       /** @type {WebGL2RenderingContext|null} */
       gl: null,
-      /** where the canvas sits in the document, CSS px */
-      box: null,
+      /** the section this plane may paint in, document CSS px */
+      contain: null,
+      /** last written inline top/height, so an unchanged frame writes nothing */
+      cssTop: '',
+      cssH: '',
       /** true between contextlost and contextrestored */
       lost: false,
       prog: null,
@@ -266,7 +283,10 @@ export class Renderer {
   }
 
   /**
-   * Where a plane's canvas sits in the document, in CSS px.
+   * The REGION a plane may paint in: the section it serves, in document CSS
+   * px. This is not the canvas — the canvas is a viewport-sized window that
+   * slides around inside this region — it is the fence the window may not
+   * leave. A resize-time fact; it does not change when the page scrolls.
    *
    * @param {string} name
    * @param {{top: number, height: number}} box
@@ -274,40 +294,90 @@ export class Renderer {
   setPlaneBox(name, box) {
     const plane = this.planes.find((p) => p.name === name)
     if (!plane) return
-    plane.box = { top: box.top, height: box.height }
-    this._sizePlane(plane)
-  }
-
-  /**
-   * Write the canvas's intrinsic size from its band. THE RUNAWAY HAZARD LIVES
-   * HERE: <canvas> is a REPLACED element, so with no CSS size its CSS box IS
-   * its intrinsic size. If a band were ever derived from a measurement of the
-   * canvas itself, this write would grow it by `dpr` on every pass until the
-   * cell count melts the frame — silently, with nothing in the console
-   * pointing at CSS. It is safe only because a band comes from the SECTION the
-   * plane serves, never from the plane.
-   * @private
-   */
-  _sizePlane(plane) {
-    if (!plane.gl || !plane.box) return
-    const layout = this.layout
-    const dpr = layout.dpr
-    const w = Math.max(1, Math.round(layout.fieldWidth * dpr))
-    const h = Math.max(1, Math.round(plane.box.height * dpr))
-    if (plane.canvas.width !== w || plane.canvas.height !== h) {
-      plane.canvas.width = w
-      plane.canvas.height = h
-    }
+    plane.contain = { top: box.top, height: box.height }
   }
 
   /** @private */
-  _ensureBox(plane) {
-    if (!plane.box) {
+  _ensureContain(plane) {
+    if (!plane.contain) {
       const rect = plane.canvas.getBoundingClientRect()
-      plane.box = { top: 0, height: rect.height || this.layout.fieldHeight }
+      plane.contain = { top: 0, height: rect.height || this.layout.fieldHeight }
     }
-    this._sizePlane(plane)
-    return plane.box
+    return plane.contain
+  }
+
+  /**
+   * Place the plane's canvas over the part of its region that is on screen,
+   * and size it to the viewport rather than to the section.
+   *
+   * THIS IS THE ONLY PLACE THE LIBRARY READS SCROLL, and it reads it to
+   * choose a BAND, never to place a cell. The canvas is ordinary page content
+   * inside the section, so the compositor scrolls it with the prose; what
+   * this decides is merely which slice of the lattice is worth allocating.
+   * A cell's position is still `origin + index * step` with no scroll term,
+   * which is why a late scroll value cannot show up as a cell in the wrong
+   * place. The failure mode of being a frame late is COVERAGE — an unpainted
+   * strip at the leading edge during a fast fling — and `MARGIN` is what
+   * absorbs it. Position cannot drift; that is the whole trade.
+   *
+   * The window is a whole number of cells, starting on a cell boundary. A
+   * fractional window would put the lattice out of phase with itself every
+   * time the band moved.
+   *
+   * @private
+   * @returns {{r0: number, rows: number, top: number}|null} null = nothing to draw
+   */
+  _window(plane, scrollY, viewH) {
+    const layout = this.layout
+    const step = layout.step_
+    if (!(step > 0)) return null
+    const contain = this._ensureContain(plane)
+
+    // The rows the section owns. `cellRectFromPx` is not used here on
+    // purpose: it clamps to the lattice for a CLIPPING answer, and this is a
+    // containment answer that also has to clamp to the section.
+    const secR0 = Math.max(0, Math.floor((contain.top - layout.originY) / step))
+    const secR1 = Math.min(
+      layout.countY,
+      Math.ceil((contain.top + contain.height - layout.originY) / step)
+    )
+    const secRows = secR1 - secR0
+    if (secRows <= 0) return null
+
+    const winRows = Math.min(secRows, Math.ceil(viewH / step) + 2 * MARGIN)
+    let r0 = Math.floor((scrollY - layout.originY) / step) - MARGIN
+    if (r0 < secR0) r0 = secR0
+    if (r0 + winRows > secR1) r0 = secR1 - winRows
+
+    const top = layout.originY + r0 * step
+    const dpr = layout.dpr
+    const w = Math.max(1, Math.round(layout.fieldWidth * dpr))
+    const h = Math.max(1, Math.round(winRows * step * dpr))
+    const canvas = plane.canvas
+    // Resizing a canvas clears it, so only write when it actually changed —
+    // and it only changes on resize, not on scroll: the window slides, it
+    // does not grow.
+    if (canvas.width !== w || canvas.height !== h) {
+      canvas.width = w
+      canvas.height = h
+    }
+    // The canvas is positioned inside its section, so the offset written here
+    // is section-local. THE RUNAWAY HAZARD: <canvas> is a REPLACED element,
+    // so with no CSS size its CSS box IS its intrinsic size. The height below
+    // is what keeps the CSS box independent of the backing store; without it
+    // a dpr > 1 canvas would report a box `dpr` times too tall, and anything
+    // measuring it would feed that back in and grow it without bound.
+    const cssTop = `${top - contain.top}px`
+    const cssH = `${winRows * step}px`
+    if (plane.cssTop !== cssTop) {
+      canvas.style.top = cssTop
+      plane.cssTop = cssTop
+    }
+    if (plane.cssH !== cssH) {
+      canvas.style.height = cssH
+      plane.cssH = cssH
+    }
+    return { r0, rows: winRows, top }
   }
 
   start() {
@@ -344,15 +414,21 @@ export class Renderer {
     const rows = layout.countY
     if (cols <= 0 || rows <= 0) return
 
+    // Read scroll ONCE, before anything writes a style. Reading it after a
+    // style write forces a synchronous layout, and there are three planes —
+    // that would be three forced layouts a frame to learn one number.
+    const scrollY = typeof window !== 'undefined' ? window.scrollY : 0
+    const viewH = typeof window !== 'undefined' ? window.innerHeight : 900
+
     for (let p = 0; p < this.planes.length; p++) {
       const plane = this.planes[p]
       const gl = plane.gl
       if (!gl || plane.lost) continue
-      const box = this._ensureBox(plane)
-      if (!(box.height > 0)) continue
+      const win = this._window(plane, scrollY, viewH)
+      if (!win) continue
 
       this.fields.compose(cols, rows, now, plane.name)
-      const n = this._pack(plane)
+      const n = this._pack(plane, win)
 
       gl.viewport(0, 0, plane.canvas.width, plane.canvas.height)
       gl.clear(gl.COLOR_BUFFER_BIT)
@@ -369,10 +445,11 @@ export class Renderer {
 
       const u = plane.uniforms
       gl.uniform2f(u.uRes, plane.canvas.width, plane.canvas.height)
-      // The lattice is document space and this canvas is a band of it, so the
-      // origin is written band-local. There is no scroll term here — that is
-      // the point of the arrangement.
-      gl.uniform2f(u.uOrigin, layout.originX, layout.originY - box.top)
+      // The lattice is document space and this canvas is a window onto it, so
+      // the origin is written window-local: `-r0 * step`, exactly. A cell's
+      // position is still its index times the step — the window subtracts a
+      // whole number of cells, never a scroll offset.
+      gl.uniform2f(u.uOrigin, layout.originX, layout.originY - win.top)
       gl.uniform1f(u.uStep, layout.step_)
       gl.uniform1f(u.uBlock, layout.blockSize)
       gl.uniform1f(u.uDpr, layout.dpr)
@@ -388,20 +465,31 @@ export class Renderer {
    * This is the only per-cell CPU work left in the renderer, and it is a flat
    * copy — no decision, no path, no rasterisation.
    *
+   * CELLS OUTSIDE THE WINDOW ARE DROPPED HERE. Producers still write their
+   * whole region — the weave composes every row of its section whether it is
+   * on screen or not — and without this filter all of those rows would be
+   * copied into the buffers and uploaded, to be clipped by the GPU after the
+   * fact. The instance count is meant to be what is VISIBLE, not what exists.
+   *
    * @private
+   * @param {{r0: number, rows: number}} win
    * @returns {number} instance count
    */
-  _pack(plane) {
+  _pack(plane, win) {
     const stack = this.fields
     let n = 0
-    // Count first so the buffers are sized once. `_dirtyCount` is the exact
-    // number of cells the compose pass touched.
+    // `_dirtyCount` is the exact number of cells the compose pass touched —
+    // an upper bound on what survives the window filter, so the buffers are
+    // sized once and never mid-walk.
     this._ensureCapacity(plane, stack._dirtyCount || 1)
     const aCell = plane.aCell
     const aXyr = plane.aXyr
     const aRgba = plane.aRgba
+    const rowMin = win.r0
+    const rowMax = win.r0 + win.rows
     stack.forEachCell((gx, gy, alpha, color, offX, offY, rot) => {
       if (!(alpha > 0)) return
+      if (gy < rowMin || gy >= rowMax) return
       const i2 = n * 2
       const i3 = n * 3
       const i4 = n * 4
