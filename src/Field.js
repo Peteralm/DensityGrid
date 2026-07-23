@@ -1,7 +1,7 @@
 /**
  * A Field reserves a rectangular REGION of the lattice and owns what gets
  * drawn there. Fields may overlap; `zIndex` decides which one supplies a
- * contested cell, and `merge` decides whether the loser is discarded or
+ * contested cell, and `blendMode` decides whether the loser is discarded or
  * composited under the winner.
  *
  * Producers are PUSH, not pull: `produce(write)` calls `write()` only for the
@@ -18,18 +18,25 @@ export class Field {
   /**
    * @param {Object} params
    * @param {string} params.name - identifier, for debug listings
-   * @param {(write: (gx: number, gy: number, alpha: number, color?: number, offX?: number, offY?: number) => void, time: number) => void} params.produce
-   *   `offX`/`offY` are a DRAW offset in px (default 0): the cell keeps its
-   *   lattice identity for composition (merge, zIndex, clipping) but is painted
-   *   displaced. This is how a field renders smooth sub-cell motion — a hover
-   *   warp, a shiver — without breaking phase lock: at rest the offsets are
-   *   zero and the lattice is bit-identical to never having had them.
+   * @param {(write: (gx: number, gy: number, alpha: number, color?: number, offX?: number, offY?: number, rot?: number) => void, time: number) => void} params.produce
+   *   `offX`/`offY` are a DRAW offset in px (default 0) and `rot` is a DRAW
+   *   rotation in radians about the cell's own centre (default 0): the cell
+   *   keeps its lattice identity for composition (blendMode, zIndex, clipping)
+   *   but is painted displaced and turned. This is how a field renders smooth
+   *   sub-cell motion — a hover warp, a shiver, a tumble — without breaking
+   *   phase lock: at rest all three are zero and the lattice is bit-identical
+   *   to never having had them.
    * @param {{col: number, row: number, cols: number, rows: number}} [params.rect]
    *   Region in lattice cells. Defaults to the whole lattice; set it (or keep
    *   it in sync via `Layout.cellRectFromPx`) to bound the field to a section.
    * @param {number} [params.zIndex=0] - higher wins a contested cell
-   * @param {'replace'|'blend'} [params.merge='replace'] - how this field
+   * @param {'Absolute'|'Blend'} [params.blendMode='Absolute'] - how this field
    *   combines with whatever a lower field already put in the cell.
+   *   `Absolute` occludes: it replaces colour, alpha AND geometry outright.
+   *   `Blend` mixes both, weighted by alpha — see FieldStack.compose.
+   * @param {'replace'|'blend'} [params.merge] - the old spelling of
+   *   `blendMode`, still accepted and mapped. `replace`→`Absolute`,
+   *   `blend`→`Blend`.
    * @param {boolean} [params.active=true] - false: `produce` is never called,
    *   and the field contributes nothing. This is the render-cost gate; drive
    *   it from an IntersectionObserver on the owning section.
@@ -41,7 +48,7 @@ export class Field {
    *   so phase lock across planes is exact by construction. Unknown plane
    *   names are dropped by the renderer rather than silently drawn to base.
    */
-  constructor({ name, produce, rect = null, zIndex = 0, merge = 'replace', active = true, plane = 'base' }) {
+  constructor({ name, produce, rect = null, zIndex = 0, blendMode, merge, active = true, plane = 'base' }) {
     /** @type {string} */
     this.name = name || 'field'
     /** @type {Function} */
@@ -50,12 +57,31 @@ export class Field {
     this.rect = rect
     /** @type {number} */
     this.zIndex = zIndex
-    /** @type {'replace'|'blend'} */
-    this.merge = merge
+    /**
+     * `blendMode` is the name; `merge` is the same axis under its old
+     * spelling, kept working so the consumer can be migrated on its own
+     * schedule instead of in the same commit as the library.
+     * @type {'Absolute'|'Blend'}
+     */
+    this.blendMode = blendMode || (merge === 'blend' ? 'Blend' : 'Absolute')
     /** @type {boolean} */
     this.active = active
     /** @type {string} raster target; see the constructor doc */
     this.plane = plane
+  }
+
+  /**
+   * The old spelling, as a live view of `blendMode` rather than a second
+   * field — two properties for one axis is how they drift apart.
+   * @deprecated use `blendMode`
+   * @type {'replace'|'blend'}
+   */
+  get merge() {
+    return this.blendMode === 'Blend' ? 'blend' : 'replace'
+  }
+
+  set merge(v) {
+    this.blendMode = v === 'blend' ? 'Blend' : 'Absolute'
   }
 
   /**
@@ -77,8 +103,9 @@ export class Field {
  * Composites the active fields into one cell surface per frame.
  *
  * Resolution is a single bottom-up pass in zIndex order: a later (higher)
- * field's `replace` simply overwrites, and its `blend` composites over what is
- * already there. No occlusion pre-pass — an opaque top field could in
+ * field's `Absolute` simply overwrites, and its `Blend` composites over what
+ * is already there. Both colour AND geometry (offX, offY, rot) follow that
+ * rule, on the same alpha weights. No occlusion pre-pass — an opaque top field could in
  * principle let lower fields skip their covered cells, but the overlap is a
  * few thousand cells against a total that is already in the same order of
  * magnitude, so the bookkeeping would cost more than it saves. Revisit only if
@@ -109,6 +136,8 @@ export class FieldStack {
     this._offX = new Float32Array(0)
     /** @private @type {Float32Array} draw offset px */
     this._offY = new Float32Array(0)
+    /** @private @type {Float32Array} draw rotation, radians about cell centre */
+    this._rot = new Float32Array(0)
     /** @private @type {Int32Array} touched-cell indices, for packing */
     this._dirty = new Int32Array(0)
     /** @private */
@@ -141,13 +170,14 @@ export class FieldStack {
     }
   }
 
-  /** @returns {Array<{name: string, zIndex: number, merge: string, active: boolean}>} */
+  /** @returns {Array<{name: string, zIndex: number, blendMode: string, active: boolean, plane: string}>} */
   list() {
     return this._fields.map((f) => ({
       name: f.name,
       zIndex: f.zIndex,
-      merge: f.merge,
+      blendMode: f.blendMode,
       active: f.active,
+      plane: f.plane,
     }))
   }
 
@@ -182,6 +212,7 @@ export class FieldStack {
     const color = this._color
     const offX = this._offX
     const offY = this._offY
+    const rot = this._rot
     const dirty = this._dirty
     let dirtyCount = 0
 
@@ -197,9 +228,9 @@ export class FieldStack {
       const rMin = r ? r.row : 0
       const cMax = r ? r.col + r.cols - 1 : cols - 1
       const rMax = r ? r.row + r.rows - 1 : rows - 1
-      const blend = field.merge === 'blend'
+      const blend = field.blendMode === 'Blend'
 
-      const write = (gx, gy, a, c, ox, oy) => {
+      const write = (gx, gy, a, c, ox, oy, rt) => {
         if (gx < cMin || gx > cMax || gy < rMin || gy > rMax) return
         if (gx < 0 || gx >= cols || gy < 0 || gy >= rows) return
         if (!(a > 0)) return
@@ -213,13 +244,20 @@ export class FieldStack {
           color[idx] = c === undefined ? 0xffffff : c
           offX[idx] = ox === undefined ? 0 : ox
           offY[idx] = oy === undefined ? 0 : oy
+          rot[idx] = rt === undefined ? 0 : rt
           return
         }
         if (!blend) {
+          // Absolute OCCLUDES. Everything about the cell is replaced —
+          // colour, alpha and geometry alike — because a field declaring
+          // itself opaque is declaring that what is under it stopped
+          // existing, and a surviving offset from below would be the cell
+          // half-remembering a producer that lost.
           alpha[idx] = a
           color[idx] = c === undefined ? 0xffffff : c
           offX[idx] = ox === undefined ? 0 : ox
           offY[idx] = oy === undefined ? 0 : oy
+          rot[idx] = rt === undefined ? 0 : rt
           return
         }
         // Source-over on premultiplied-by-alpha channels: the incoming cell
@@ -235,12 +273,27 @@ export class FieldStack {
           const g8 = ((ct >> 8) & 0xff) * wTop + ((cb >> 8) & 0xff) * wBot
           const b8 = (ct & 0xff) * wTop + (cb & 0xff) * wBot
           color[idx] = ((r8 & 0xff) << 16) | ((g8 & 0xff) << 8) | (b8 & 0xff)
+          // GEOMETRY MIXES ON THE SAME WEIGHTS AS COLOUR. There is exactly one
+          // cell, so two Blend fields disagreeing about where it sits is the
+          // same kind of disagreement as two fields disagreeing about its
+          // colour, and it is answered the same way. This reverses an earlier
+          // rule that let the topmost writer own the motion outright; that
+          // rule was written when `blend` meant "tint what is underneath" and
+          // the only mover was the top field, so top-wins and the average were
+          // indistinguishable in practice. They stop being indistinguishable
+          // once two fields both move, and averaging is the one that keeps a
+          // single cell reading as a single object.
+          //
+          // Angle averages NUMERICALLY, with no wraparound handling: 350° and
+          // 10° resolve to 180°, not 0°. That is the chosen semantics, not an
+          // oversight. A shortest-arc fix would make the result depend on how
+          // each producer happened to phrase its angle, and a cell has no
+          // notion of which turn was "meant".
+          offX[idx] = (ox === undefined ? 0 : ox) * wTop + offX[idx] * wBot
+          offY[idx] = (oy === undefined ? 0 : oy) * wTop + offY[idx] * wBot
+          rot[idx] = (rt === undefined ? 0 : rt) * wTop + rot[idx] * wBot
         }
         alpha[idx] = out
-        // The topmost writer owns the motion — offsets replace, never average:
-        // a half-blended position reads as the cell tearing between two homes.
-        offX[idx] = ox === undefined ? 0 : ox
-        offY[idx] = oy === undefined ? 0 : oy
       }
 
       field.produce(write, time)
@@ -252,7 +305,7 @@ export class FieldStack {
   /**
    * Walk the cells written by the last `compose()`.
    *
-   * @param {(gx: number, gy: number, alpha: number, color: number, offX: number, offY: number) => void} fn
+   * @param {(gx: number, gy: number, alpha: number, color: number, offX: number, offY: number, rot: number) => void} fn
    */
   forEachCell(fn) {
     const cols = this._cols
@@ -261,9 +314,10 @@ export class FieldStack {
     const color = this._color
     const offX = this._offX
     const offY = this._offY
+    const rot = this._rot
     for (let k = 0; k < this._dirtyCount; k++) {
       const idx = dirty[k]
-      fn(idx % cols, (idx / cols) | 0, alpha[idx], color[idx], offX[idx], offY[idx])
+      fn(idx % cols, (idx / cols) | 0, alpha[idx], color[idx], offX[idx], offY[idx], rot[idx])
     }
   }
 
@@ -278,6 +332,7 @@ export class FieldStack {
     this._color = new Uint32Array(n)
     this._offX = new Float32Array(n)
     this._offY = new Float32Array(n)
+    this._rot = new Float32Array(n)
     this._dirty = new Int32Array(n)
     this._dirtyCount = 0
     this._frameId = 0
