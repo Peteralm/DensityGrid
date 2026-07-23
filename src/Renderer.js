@@ -168,6 +168,28 @@ export class Renderer {
     const gl = canvas.getContext('webgl2', { alpha: true, antialias: false })
     if (!gl) return plane
     plane.gl = gl
+
+    // A LOST CONTEXT IS NORMAL, not exceptional: the driver resets, the GPU
+    // is taken by another tab, the laptop switches graphics. Every object
+    // this renderer holds — program, VAO, buffers — is invalid afterwards and
+    // silently does nothing, so the plane stops drawing and waits.
+    // `preventDefault` is what makes the browser promise a restore event; a
+    // context lost without it never comes back.
+    canvas.addEventListener('webglcontextlost', (e) => {
+      e.preventDefault()
+      plane.lost = true
+    })
+    canvas.addEventListener('webglcontextrestored', () => {
+      // Rebuild from nothing. Capacity goes to zero so the per-instance
+      // buffers are reallocated rather than trusted, and the style cache is
+      // cleared so the window re-asserts its geometry on the next frame.
+      plane.capacity = 0
+      plane.cssTop = ''
+      plane.cssH = ''
+      this._buildGL(plane)
+      plane.lost = false
+    })
+
     this._buildGL(plane)
     return plane
   }
